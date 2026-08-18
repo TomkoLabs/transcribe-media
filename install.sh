@@ -1,0 +1,283 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+TOOLS_DIR="$ROOT/.tools"
+VENV_DIR="$ROOT/.venv"
+PYTHON="$VENV_DIR/bin/python"
+LAUNCHER="$ROOT/transcribe-media"
+CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/transcribe-media"
+CONFIG_FILE="$CONFIG_DIR/config.env"
+
+FORCE_CPU=0
+SKIP_SYSTEM_PACKAGES=0
+SKIP_MODEL_DOWNLOADS=0
+NON_INTERACTIVE=0
+HF_TOKEN_VALUE="${HF_TOKEN:-${HUGGINGFACE_TOKEN:-}}"
+export PATH="$TOOLS_DIR:$PATH"
+
+usage() {
+    cat <<'EOF'
+Usage: ./install.sh [options]
+
+Options:
+  --cpu                    Install the CPU PyTorch build even if NVIDIA is found
+  --skip-system-packages   Do not invoke the OS package manager
+  --skip-model-downloads   Defer weights; run --prepare-models later while online
+  --with-emotion           Accepted for compatibility (SpeechBrain is now installed by default)
+  --hf-token TOKEN         Save a Hugging Face token non-interactively
+  --non-interactive        Never prompt for sudo or a Hugging Face token
+  -h, --help               Show this help
+EOF
+}
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --cpu) FORCE_CPU=1 ;;
+        --skip-system-packages) SKIP_SYSTEM_PACKAGES=1 ;;
+        --skip-model-downloads) SKIP_MODEL_DOWNLOADS=1 ;;
+        --with-emotion) ;;
+        --hf-token)
+            [[ $# -ge 2 ]] || { echo "--hf-token requires a value" >&2; exit 2; }
+            HF_TOKEN_VALUE="$2"
+            shift
+            ;;
+        --non-interactive) NON_INTERACTIVE=1 ;;
+        -h|--help) usage; exit 0 ;;
+        *) echo "Unknown option: $1" >&2; usage >&2; exit 2 ;;
+    esac
+    shift
+done
+
+log() { printf '\n==> %s\n' "$*"; }
+warn() { printf 'WARNING: %s\n' "$*" >&2; }
+
+run_privileged() {
+    if [[ ${EUID:-$(id -u)} -eq 0 ]]; then
+        "$@"
+    elif command -v sudo >/dev/null 2>&1 && [[ $NON_INTERACTIVE -eq 0 ]]; then
+        sudo "$@"
+    else
+        return 1
+    fi
+}
+
+install_system_packages() {
+    [[ $SKIP_SYSTEM_PACKAGES -eq 0 ]] || return 0
+    log "Installing required system packages when possible"
+
+    if command -v apt-get >/dev/null 2>&1; then
+        run_privileged apt-get update || warn "Could not run apt-get update automatically."
+        run_privileged apt-get install -y ffmpeg curl ca-certificates git libsndfile1 xz-utils || \
+            warn "Some apt packages could not be installed automatically."
+    elif command -v dnf >/dev/null 2>&1; then
+        run_privileged dnf install -y ffmpeg curl ca-certificates git libsndfile xz || \
+            warn "Some dnf packages could not be installed. FFmpeg may require RPM Fusion."
+    elif command -v yum >/dev/null 2>&1; then
+        run_privileged yum install -y ffmpeg curl ca-certificates git libsndfile xz || \
+            warn "Some yum packages could not be installed. FFmpeg may require RPM Fusion."
+    elif command -v pacman >/dev/null 2>&1; then
+        run_privileged pacman -Sy --needed --noconfirm ffmpeg curl ca-certificates git libsndfile xz || \
+            warn "Some pacman packages could not be installed automatically."
+    elif command -v zypper >/dev/null 2>&1; then
+        run_privileged zypper --non-interactive install ffmpeg curl ca-certificates git libsndfile1 xz || \
+            warn "Some zypper packages could not be installed automatically."
+    else
+        warn "No supported package manager found; install FFmpeg and curl manually."
+    fi
+}
+
+install_uv() {
+    if command -v uv >/dev/null 2>&1; then
+        UV="$(command -v uv)"
+        return
+    fi
+    if [[ -x "$TOOLS_DIR/uv" ]]; then
+        UV="$TOOLS_DIR/uv"
+        return
+    fi
+    command -v curl >/dev/null 2>&1 || { echo "curl is required to install uv." >&2; exit 1; }
+    log "Installing the uv Python environment manager locally"
+    mkdir -p "$TOOLS_DIR"
+    curl -LsSf https://astral.sh/uv/install.sh | \
+        env UV_INSTALL_DIR="$TOOLS_DIR" UV_NO_MODIFY_PATH=1 sh
+    UV="$TOOLS_DIR/uv"
+    [[ -x "$UV" ]] || { echo "uv installation failed." >&2; exit 1; }
+}
+
+install_local_ffmpeg() {
+    command -v ffmpeg >/dev/null 2>&1 && command -v ffprobe >/dev/null 2>&1 && return 0
+    command -v curl >/dev/null 2>&1 || {
+        echo "curl is required for the unprivileged FFmpeg fallback." >&2
+        exit 1
+    }
+    tar --help 2>&1 | grep -q -- "-J" || {
+        echo "tar with xz support is required for the private FFmpeg fallback." >&2
+        exit 1
+    }
+
+    local machine archive_name github_archive
+    machine="$(uname -m)"
+    case "$machine" in
+        x86_64|amd64)
+            archive_name="ffmpeg-release-amd64-static.tar.xz"
+            github_archive="ffmpeg-master-latest-linux64-gpl.tar.xz"
+            ;;
+        aarch64|arm64)
+            archive_name="ffmpeg-release-arm64-static.tar.xz"
+            github_archive="ffmpeg-master-latest-linuxarm64-gpl.tar.xz"
+            ;;
+        *)
+            echo "No local FFmpeg fallback is available for architecture: $machine" >&2
+            echo "Install FFmpeg and FFprobe with the system package manager." >&2
+            exit 1
+            ;;
+    esac
+
+    log "Installing a private FFmpeg/FFprobe runtime (no administrator access needed)"
+    mkdir -p "$TOOLS_DIR"
+    local archive extract_dir ffmpeg_path ffprobe_path
+    archive="$TOOLS_DIR/$github_archive"
+    extract_dir="$(mktemp -d "$TOOLS_DIR/ffmpeg-extract.XXXXXX")"
+    if ! curl -fL --retry 3 --retry-delay 2 \
+        "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/$github_archive" \
+        -o "$archive"; then
+        warn "Primary FFmpeg mirror failed; trying the secondary mirror."
+        archive="$TOOLS_DIR/$archive_name"
+        curl -fL --retry 3 --retry-delay 2 \
+            "https://johnvansickle.com/ffmpeg/releases/$archive_name" -o "$archive"
+    fi
+    tar -xJf "$archive" -C "$extract_dir"
+    ffmpeg_path="$(find "$extract_dir" -type f -name ffmpeg -print -quit)"
+    ffprobe_path="$(find "$extract_dir" -type f -name ffprobe -print -quit)"
+    [[ -n "$ffmpeg_path" && -n "$ffprobe_path" ]] || {
+        echo "The FFmpeg fallback archive did not contain both executables." >&2
+        exit 1
+    }
+    install -m 0755 "$ffmpeg_path" "$TOOLS_DIR/ffmpeg"
+    install -m 0755 "$ffprobe_path" "$TOOLS_DIR/ffprobe"
+    rm -rf "$extract_dir"
+    rm -f "$archive"
+    ffmpeg -version >/dev/null
+    ffprobe -version >/dev/null
+}
+
+install_python_environment() {
+    log "Creating a managed Python 3.11 environment"
+    "$UV" python install 3.11
+    "$UV" venv --python 3.11 --clear "$VENV_DIR"
+
+    local gpu_candidate=0
+    if [[ $FORCE_CPU -eq 0 ]] && command -v nvidia-smi >/dev/null 2>&1 && nvidia-smi >/dev/null 2>&1; then
+        gpu_candidate=1
+    fi
+
+    if [[ $gpu_candidate -eq 1 ]]; then
+        log "NVIDIA GPU detected; installing PyTorch 2.8 with CUDA 12.6 runtime"
+        if ! "$UV" pip install --python "$PYTHON" \
+            --index-url https://download.pytorch.org/whl/cu126 \
+            torch==2.8.0 torchvision==0.23.0 torchaudio==2.8.0; then
+            warn "CUDA PyTorch installation failed; installing CPU wheels instead."
+            gpu_candidate=0
+        fi
+    fi
+
+    if [[ $gpu_candidate -eq 0 ]]; then
+        log "Installing CPU PyTorch runtime"
+        "$UV" pip install --python "$PYTHON" \
+            --index-url https://download.pytorch.org/whl/cpu \
+            torch==2.8.0 torchvision==0.23.0 torchaudio==2.8.0
+    fi
+
+    log "Installing transcription, speaker, acoustic, and tone dependencies"
+    "$UV" pip install --python "$PYTHON" -r "$ROOT/requirements.txt"
+
+    if [[ $gpu_candidate -eq 1 ]]; then
+        "$UV" pip install --python "$PYTHON" -r "$ROOT/requirements-gpu.txt"
+        if ! "$PYTHON" - <<'PYTEST'
+import torch
+assert torch.cuda.is_available(), "PyTorch reports CUDA unavailable"
+value = (torch.ones(1, device="cuda") * 2).item()
+assert value == 2, "CUDA arithmetic test failed"
+print(torch.cuda.get_device_name(0))
+PYTEST
+        then
+            warn "The CUDA environment did not validate; switching to CPU PyTorch."
+            "$UV" pip install --python "$PYTHON" --force-reinstall \
+                --index-url https://download.pytorch.org/whl/cpu \
+                torch==2.8.0 torchvision==0.23.0 torchaudio==2.8.0
+        fi
+    fi
+}
+
+configure_diarization() {
+    if [[ -n "$HF_TOKEN_VALUE" ]]; then
+        log "Saving the Hugging Face token"
+        "$LAUNCHER" --configure --non-interactive --hf-token "$HF_TOKEN_VALUE" || \
+            warn "Token storage failed. Token-free speaker clustering remains available."
+        return
+    fi
+
+    if [[ -f "$CONFIG_FILE" ]]; then
+        log "Using existing diarization configuration: $CONFIG_FILE"
+        return
+    fi
+
+    if [[ $NON_INTERACTIVE -eq 1 || ! -t 0 ]]; then
+        warn "No Hugging Face token supplied; the token-free speaker clustering fallback will be used."
+        return
+    fi
+
+    log "Optional one-time speaker-detection setup"
+    "$LAUNCHER" --configure || true
+}
+
+install_command() {
+    mkdir -p "$HOME/.local/bin"
+    ln -sfn "$LAUNCHER" "$HOME/.local/bin/transcribe-media"
+    if [[ ":$PATH:" != *":$HOME/.local/bin:"* ]]; then
+        warn "$HOME/.local/bin is not currently in PATH. Add it or invoke: $LAUNCHER"
+    fi
+}
+
+install_system_packages
+install_uv
+install_local_ffmpeg
+chmod +x "$LAUNCHER" "$ROOT/transcribe_media.py"
+install_python_environment
+mkdir -p "$ROOT/Video Source" "$ROOT/Transcribed" "$ROOT/Review"
+if [[ -s "$ROOT/Review/speaker_registry.json" ]]; then
+    warn "Preserving the existing persistent voice registry in $ROOT/Review."
+    warn "Git pull and reinstall do not reset ignored Review state or restart VOICE numbering."
+    warn "To intentionally start over, run: $LAUNCHER --reset-speaker-registry"
+fi
+configure_diarization
+install_command
+
+log "Validating the installation"
+"$LAUNCHER" --doctor
+
+if [[ $SKIP_MODEL_DOWNLOADS -eq 0 ]]; then
+    log "Downloading and validating the default models"
+    if ! "$LAUNCHER" --prepare-models; then
+        warn "Model preparation failed. Rerun 'transcribe-media --prepare-models' while online."
+    fi
+fi
+
+cat <<EOF
+
+Installation complete.
+
+Put media in:
+  $ROOT/Video Source
+
+Then run:
+  transcribe-media
+
+Or use the repository launcher directly:
+  $LAUNCHER
+
+Useful checks:
+  transcribe-media --doctor
+  transcribe-media --configure
+EOF

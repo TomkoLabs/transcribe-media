@@ -1,0 +1,45 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SOURCE="${BASH_SOURCE[0]}"
+while [[ -L "$SOURCE" ]]; do
+    DIR="$(cd -P "$(dirname "$SOURCE")" >/dev/null 2>&1 && pwd)"
+    SOURCE="$(readlink "$SOURCE")"
+    [[ "$SOURCE" != /* ]] && SOURCE="$DIR/$SOURCE"
+done
+ROOT="$(cd -P "$(dirname "$SOURCE")" >/dev/null 2>&1 && pwd)"
+PYTHON="$ROOT/.venv/bin/python"
+export TRANSCRIBE_MEDIA_ROOT="$ROOT"
+export PATH="$ROOT/.tools:$PATH"
+export PYANNOTE_METRICS_ENABLED=0
+export HF_HUB_DISABLE_TELEMETRY=1
+export DO_NOT_TRACK=1
+export ORT_DISABLE_TELEMETRY=1
+
+if [[ ! -x "$PYTHON" ]]; then
+    echo "transcribe-media is not installed yet. Run: $ROOT/install.sh" >&2
+    exit 1
+fi
+
+# faster-whisper/CTranslate2 needs the pip-installed CUDA runtime directories in
+# LD_LIBRARY_PATH before Python starts. Discover them automatically.
+CUDA_LIBS="$($PYTHON - <<'PY' 2>/dev/null || true
+import site
+from pathlib import Path
+
+found = []
+for root in [*site.getsitepackages(), site.getusersitepackages()]:
+    base = Path(root)
+    for relative in ("nvidia/cublas/lib", "nvidia/cudnn/lib"):
+        path = base / relative
+        if path.is_dir():
+            found.append(str(path))
+print(":".join(dict.fromkeys(found)))
+PY
+)"
+
+if [[ -n "$CUDA_LIBS" ]]; then
+    export LD_LIBRARY_PATH="$CUDA_LIBS${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+fi
+
+exec "$PYTHON" "$ROOT/transcribe_media.py" "$@"

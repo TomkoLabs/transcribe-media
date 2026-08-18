@@ -1,0 +1,16 @@
+# WhisperX includes faster-whisper/CTranslate2 and pyannote integration.
+# SpeechBrain provides token-free acoustic speaker clustering and the fallback
+# IEMOCAP tone estimator. FunASR runs the default emotion2vec+ Large tone model.
+# Scikit-learn supplies deterministic global speaker clustering.
+# CTranslate2 4.8.x has an upstream CUDA regression that can raise
+# cudaErrorInvalidDevice during real Whisper inference on a valid single GPU.
+# Keep the latest pre-regression release until upstream resolves issue #2064.
+ctranslate2==4.7.2
+whisperx==3.8.6
+faster-whisper==1.2.1
+pyannote-audio==4.0.7
+speechbrain==1.1.0
+funasr==1.4.2
+scikit-learn==1.9.0
+transformers==4.57.6
+huggingface-hub==0.36.2

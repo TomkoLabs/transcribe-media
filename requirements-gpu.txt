@@ -1,0 +1,4 @@
+# CTranslate2/faster-whisper CUDA runtime libraries for Linux. The launcher
+# discovers these directories and sets LD_LIBRARY_PATH automatically.
+nvidia-cublas-cu12==12.6.4.1
+nvidia-cudnn-cu12==9.10.2.21
