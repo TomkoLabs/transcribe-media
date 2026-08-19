@@ -2,3 +2,7 @@
 # discovers these directories and sets LD_LIBRARY_PATH automatically.
 nvidia-cublas-cu12==12.6.4.1
 nvidia-cudnn-cu12==9.10.2.21
+
+# Stable NeMo ASR release providing NVIDIA Sortformer v2.1. CUDA installs use
+# it as a second opinion beside pyannote Community-1 when a token is configured.
+nemo-toolkit[asr]==2.7.3

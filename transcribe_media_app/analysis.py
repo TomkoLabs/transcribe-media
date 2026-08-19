@@ -53,6 +53,10 @@ def normalize_segments(result: dict[str, Any]) -> list[dict[str, Any]]:
                     "speaker": word.get("speaker"),
                     "local_speaker": word.get("local_speaker"),
                     "diarization_speaker": word.get("diarization_speaker"),
+                    "sortformer_speaker": word.get("sortformer_speaker"),
+                    "sortformer_model_speaker": word.get(
+                        "sortformer_model_speaker"
+                    ),
                     "speaker_refinement": word.get("speaker_refinement"),
                     "speaker_identity": word.get("speaker_identity"),
                 }
@@ -211,6 +215,90 @@ def build_turns(
         )
     annotate_timing_relationships(turns)
     return turns
+
+
+def annotate_speaker_attribution(
+    turns: list[dict[str, Any]],
+    refinement_report: Optional[dict[str, Any]] = None,
+) -> None:
+    """Expose evidence conflicts without pretending speaker IDs are certain.
+
+    The final assigned speaker remains intact for conversational structure and
+    cross-recording matching. A turn is marked uncertain only when an
+    independent diarizer materially disagrees or a linguistically suspicious
+    label seam reached the acoustic refiner but could not be resolved.
+    """
+    suspicious_intervals: list[tuple[float, float, str]] = []
+    for candidate in (refinement_report or {}).get("evaluated_candidates") or []:
+        decision = str(candidate.get("decision") or "")
+        strategy = str(candidate.get("strategy") or "")
+        unresolved_seam = bool(
+            decision == "abstained_below_confidence_threshold"
+            and (
+                strategy == "bracketed_utterance"
+                or candidate.get("sentence_seam_continuation")
+                or candidate.get("sandwiched_sentence_continuation")
+            )
+        )
+        if decision != "abstained_sortformer_disagreement" and not unresolved_seam:
+            continue
+        start = _number(candidate.get("start"), -1.0)
+        end = _number(candidate.get("end"), -1.0)
+        if start < 0.0 or end <= start:
+            continue
+        reason = (
+            "refinement_model_disagreement"
+            if decision == "abstained_sortformer_disagreement"
+            else "unresolved_sentence_continuation"
+        )
+        suspicious_intervals.append((start, end, reason))
+
+    for turn in turns:
+        reasons: list[str] = []
+        compared_seconds = 0.0
+        disagreement_seconds = 0.0
+        for word in turn.get("words") or []:
+            secondary = word.get("sortformer_speaker")
+            local = word.get("local_speaker")
+            if not secondary or not local:
+                continue
+            start = word.get("start")
+            end = word.get("end")
+            duration = (
+                max(0.0, _number(end) - _number(start))
+                if start is not None and end is not None
+                else 0.2
+            )
+            compared_seconds += duration
+            if str(secondary) != str(local):
+                disagreement_seconds += duration
+        disagreement_fraction = (
+            disagreement_seconds / compared_seconds if compared_seconds > 0.0 else 0.0
+        )
+        if compared_seconds >= 0.5 and disagreement_fraction >= 0.65:
+            reasons.append("sortformer_majority_disagrees")
+
+        turn_start = _number(turn.get("start"))
+        turn_end = max(turn_start, _number(turn.get("end"), turn_start))
+        for start, end, reason in suspicious_intervals:
+            overlap = max(0.0, min(turn_end, end) - max(turn_start, start))
+            if overlap >= min(0.1, max(0.01, (turn_end - turn_start) * 0.1)):
+                if reason not in reasons:
+                    reasons.append(reason)
+
+        confidence = turn.get("speaker_confidence")
+        if confidence is not None and _number(confidence, 1.0) < 0.5:
+            reasons.append("low_speaker_confidence")
+
+        turn["speaker_attribution"] = {
+            "status": "uncertain" if reasons else "assigned",
+            "assigned_speaker": str(
+                turn.get("speaker") or "SPEAKER_UNKNOWN"
+            ),
+            "reasons": reasons,
+            "sortformer_compared_seconds": round(compared_seconds, 3),
+            "sortformer_disagreement_fraction": round(disagreement_fraction, 4),
+        }
 
 
 def annotate_timing_relationships(turns: list[dict[str, Any]]) -> None:

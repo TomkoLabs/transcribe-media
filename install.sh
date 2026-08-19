@@ -189,11 +189,15 @@ install_python_environment() {
             torch==2.8.0 torchvision==0.23.0 torchaudio==2.8.0
     fi
 
-    log "Installing transcription, speaker, acoustic, and tone dependencies"
-    "$UV" pip install --python "$PYTHON" -r "$ROOT/requirements.txt"
-
     if [[ $gpu_candidate -eq 1 ]]; then
-        "$UV" pip install --python "$PYTHON" -r "$ROOT/requirements-gpu.txt"
+        log "Installing transcription, speaker, acoustic, tone, and GPU diarization dependencies"
+        # Keep the CUDA wheels selected above as hard resolver constraints. NeMo
+        # supports newer Torch releases too, but this project validates 2.8 as a
+        # matched torch/vision/audio set and must not silently upgrade one member.
+        "$UV" pip install --python "$PYTHON" \
+            -r "$ROOT/requirements.txt" \
+            -r "$ROOT/requirements-gpu.txt" \
+            torch==2.8.0 torchvision==0.23.0 torchaudio==2.8.0
         if ! "$PYTHON" - <<'PYTEST'
 import torch
 assert torch.cuda.is_available(), "PyTorch reports CUDA unavailable"
@@ -207,6 +211,9 @@ PYTEST
                 --index-url https://download.pytorch.org/whl/cpu \
                 torch==2.8.0 torchvision==0.23.0 torchaudio==2.8.0
         fi
+    else
+        log "Installing transcription, speaker, acoustic, and tone dependencies"
+        "$UV" pip install --python "$PYTHON" -r "$ROOT/requirements.txt"
     fi
 }
 

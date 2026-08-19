@@ -3,15 +3,17 @@
 ## TL;DR
 
 `transcribe-media` is a private, local-first Linux tool that turns a folder of
-audio/video recordings into timestamped transcripts with anonymous speaker
-labels, measured acoustic observations, and approximate vocal-tone estimates.
+audio/video recordings into concise analysis-ready transcripts plus detailed,
+timestamped review evidence with anonymous speaker labels, measured acoustic
+observations, and approximate vocal-tone estimates.
 
 It uses accuracy-oriented models by default: WhisperX/Whisper `large-v3` for
-speech recognition and alignment, pyannote Community-1 when configured (or a
-SpeechBrain fallback) for speaker separation, ECAPA voice embeddings for
-confidence-gated label correction and cross-recording matching, and
-emotion2vec+ Large for tone estimation. NVIDIA CUDA is used automatically when
-available; CPU processing is fully supported.
+speech recognition and alignment; pyannote Community-1 plus NVIDIA Sortformer
+v2.1 on CUDA installations when configured (or a SpeechBrain fallback) for
+speaker separation; ECAPA voice embeddings for confidence-gated label
+correction and cross-recording matching; and emotion2vec+ Large for tone
+estimation. NVIDIA CUDA is used automatically when available; CPU processing is
+fully supported.
 
 One intended use is preparing objective, reviewable source material for later
 analysis by a qualified therapist, including couples-therapy review. The output
@@ -33,15 +35,16 @@ conversation:
 ./transcribe-media --min-speakers 2 --max-speakers 2
 ```
 
-TXT transcripts appear in `./Transcribed/`. Detailed JSON, processing state,
-and the private voice registry appear in `./Review/`.
+Concise TXT transcripts appear in `./Transcribed/`. Timestamped detailed TXT,
+JSON evidence, processing state, and the private voice registry appear in
+`./Review/`.
 
 ## What it does
 
 For each supported media file, the pipeline:
 
 ```text
-FFmpeg decode -> transcription -> word alignment -> speaker diarization
+FFmpeg decode -> transcription -> word alignment -> diarization/model consensus
               -> confidence-gated speaker refinement
               -> persistent anonymous voice matching
               -> acoustic/tone analysis -> TXT + JSON
@@ -51,28 +54,38 @@ The source file is opened read-only and is never renamed, moved, modified, or
 uploaded to a transcription service. Normal processing happens locally after
 the dependencies and model weights have been downloaded.
 
-Example TXT output:
+Example analysis-ready TXT output:
 
 ```text
-[00:12:14.320 - 00:12:18.700] VOICE_0002:
+VOICE_0002:
 I mean... I—I don't know, you just always...
-[Observed: elevated volume; fast speech; overlap]
-[Tone approx: neutral 61%, sad 24%, unclassified 10%; model: emotion2vec/emotion2vec_plus_large]
+[Context: elevated volume; overlapping speech]
+[Vocal tone estimate: sad]
 ```
+
+The concise transcript preserves ASR wording and conversational order without
+per-turn timestamps or repeated model metadata. Adjacent turns from the same
+speaker are joined into bounded paragraphs. Only objective interaction markers
+and strong, stable, non-neutral model-based vocal-tone signals are retained;
+weak, neutral, unclassified, temporally inconsistent, and heuristic tone
+results stay out of this downstream-oriented view.
 
 Default artifacts for `Video Source/clip.mp4` are:
 
 ```text
 Transcribed/clip.mp4.txt
+Review/clip.mp4.detailed.txt
 Review/clip.mp4.json
 Review/transcription_manifest.json
 Review/speaker_registry.json
 ```
 
-JSON includes the source fingerprint, model/runtime provenance, aligned words,
-speaker turns, local and persistent speaker IDs, acoustic measurements, tone
-scores, confidence values where available, and processing limitations. Optional
-subtitles can be requested with:
+The detailed TXT retains timestamps, all acoustic flags, and complete tone
+percentages while naming each model once in its header. JSON includes the
+source fingerprint, model/runtime provenance, aligned words, speaker turns,
+local and persistent speaker IDs, explicit attribution uncertainty, acoustic
+measurements, tone scores, confidence values where available, and processing
+limitations. Optional subtitles can be requested with:
 
 ```bash
 ./transcribe-media --review-formats json,srt,vtt
@@ -137,7 +150,16 @@ pyannote Community-1 after accepting its model terms:
 ```
 
 Without a token, the installed SpeechBrain ECAPA fallback remains fully local
-and functional, but it cannot separate simultaneous voices as accurately.
+and functional. On an NVIDIA installation, Sortformer can operate without
+pyannote, but the two-model ensemble is preferred when the token is available.
+
+The default CUDA installation includes pinned NeMo `2.7.3` and NVIDIA's
+four-speaker Sortformer v2.1. In automatic mode, Community-1 remains the primary
+timeline and Sortformer supplies an independent second opinion mapped into the
+same recording-local labels. Disagreements are retained in JSON instead of
+being silently forced. Use `--diarization-backend pyannote` to compare the
+single-model result. Sortformer is primarily English and supports at most four
+speakers.
 
 After diarization, the default acoustic refinement pass rechecks short,
 non-overlapping label changes against clean voice prototypes from the complete
@@ -145,6 +167,9 @@ recording. It changes a label only when the neighboring speaker is supported by
 a strong similarity margin; ambiguous turns and genuine overlap are preserved.
 For English, an extra narrow rule also checks label changes at near-zero-gap
 sentence seams, including a mislabeled continuation lasting several seconds.
+It also embeds a complete aligned utterance when individual words form a
+fragmented A-B-A label pattern, allowing pieces too short to classify alone to
+be judged together.
 JSON retains the original diarization speaker, the corrected assignment, and
 the scores used for the decision. Disable this conservative pass when comparing
 raw diarization behavior:
@@ -214,11 +239,16 @@ errors are retried with smaller ASR batches.
 - Keep speaker labels for downstream structure, but treat them as probabilistic
   attribution and verify consequential quotations against the recording. Text
   alone is not reliable enough for an LLM to reconstruct who spoke each turn.
+- Condensed TXT marks evidence conflicts as `speaker attribution uncertain`
+  rather than presenting every boundary as equally reliable. The assigned ID
+  remains visible, and the detailed JSON retains the reasons and model evidence.
 - `Observed` annotations are measured timing/acoustic features. `Tone approx`
   is uncertain vocal-presentation classification; `unclassified` is a valid
   model abstention, not a processing failure.
 - Generated material requires human review before clinical, legal, employment,
   safety, or other consequential use.
+- Sortformer model weights are downloaded separately under the NVIDIA Open
+  Model License; this repository does not redistribute them.
 
 ## Development
 

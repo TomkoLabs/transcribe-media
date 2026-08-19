@@ -5,6 +5,7 @@ import io
 import logging
 import math
 import os
+import re
 import subprocess
 import tempfile
 from contextlib import redirect_stderr, redirect_stdout
@@ -22,7 +23,7 @@ from .speakers import (
 
 LOG = logging.getLogger(__name__)
 SUPPORTED_CTRANSLATE2_VERSION = "4.7.2"
-SPEAKER_REFINEMENT_VERSION = "1.1"
+SPEAKER_REFINEMENT_VERSION = "1.2"
 SPEAKER_REFINEMENT_MAX_RUN_SECONDS = 2.0
 SPEAKER_REFINEMENT_CONTEXT_GAP_SECONDS = 1.25
 SPEAKER_REFINEMENT_SENTENCE_SEAM_GAP_SECONDS = 0.12
@@ -34,6 +35,11 @@ SPEAKER_REFINEMENT_DOUBLE_CONTEXT_MARGIN = 0.10
 SPEAKER_REFINEMENT_MICRO_RUN_SECONDS = 0.50
 SPEAKER_REFINEMENT_MICRO_MIN_SIMILARITY = 0.42
 SPEAKER_REFINEMENT_MICRO_MIN_MARGIN = 0.20
+SPEAKER_REFINEMENT_UTTERANCE_GAP_SECONDS = 0.35
+SPEAKER_REFINEMENT_UTTERANCE_MAX_SECONDS = 12.0
+SPEAKER_REFINEMENT_UTTERANCE_MIN_SIMILARITY = 0.52
+SPEAKER_REFINEMENT_UTTERANCE_MIN_MARGIN = 0.14
+SORTFORMER_MODEL = "nvidia/diar_streaming_sortformer_4spk-v2.1"
 
 
 def _model_cache(*parts: str) -> Path:
@@ -544,6 +550,310 @@ class PyannoteDiarizer:
         return assigned
 
 
+def _sortformer_speaker(label: Any) -> str:
+    text = str(label)
+    match = re.search(r"(\d+)$", text)
+    if match:
+        return f"SPEAKER_{int(match.group(1)):02d}"
+    safe = re.sub(r"[^A-Za-z0-9]+", "_", text).strip("_").upper()
+    return f"SORTFORMER_{safe or 'UNKNOWN'}"
+
+
+def _parse_sortformer_segment(item: Any) -> dict[str, Any]:
+    if isinstance(item, str):
+        values = item.split()
+        if len(values) < 3:
+            raise ValueError(f"invalid Sortformer segment: {item!r}")
+        start, end, speaker = values[0], values[1], values[2]
+    elif isinstance(item, dict):
+        start = item.get("start", item.get("begin"))
+        end = item.get("end")
+        speaker = item.get("speaker", item.get("label"))
+    elif isinstance(item, (tuple, list)) and len(item) >= 3:
+        start, end, speaker = item[0], item[1], item[2]
+    else:
+        start = getattr(item, "start", getattr(item, "begin", None))
+        end = getattr(item, "end", None)
+        speaker = getattr(item, "speaker", getattr(item, "label", None))
+    if start is None or end is None or speaker is None:
+        raise ValueError(f"invalid Sortformer segment: {item!r}")
+    start_value = max(0.0, float(start))
+    end_value = max(start_value, float(end))
+    return {
+        "start": start_value,
+        "end": end_value,
+        "speaker": _sortformer_speaker(speaker),
+        "model_speaker": str(speaker),
+    }
+
+
+class SortformerDiarizer:
+    """NVIDIA Sortformer v2.1 long-form diarization through NeMo."""
+
+    name = "nvidia/sortformer-v2.1"
+    model_name = SORTFORMER_MODEL
+
+    def __init__(self, device: str, model: Any = None) -> None:
+        import torch
+
+        if model is None:
+            from nemo.collections.asr.models import SortformerEncLabelModel
+
+            model = SortformerEncLabelModel.from_pretrained(self.model_name)
+        self.device = device
+        self.model = model.to(torch.device(device)) if hasattr(model, "to") else model
+        if hasattr(self.model, "eval"):
+            self.model.eval()
+        modules = getattr(self.model, "sortformer_modules", None)
+        if modules is not None:
+            modules.chunk_len = 340
+            modules.chunk_right_context = 40
+            modules.fifo_len = 40
+            modules.spkcache_update_period = 300
+            if hasattr(modules, "spkcache_len"):
+                modules.spkcache_len = 188
+            check = getattr(modules, "_check_streaming_parameters", None)
+            if callable(check):
+                check()
+        self.last_run: dict[str, Any] = {}
+
+    def diarize(self, audio: Any) -> list[dict[str, Any]]:
+        import numpy as np
+        import torch
+
+        samples = np.asarray(audio, dtype=np.float32)
+        with torch.inference_mode():
+            predicted = self.model.diarize(
+                audio=[samples],
+                batch_size=1,
+                sample_rate=SAMPLE_RATE,
+            )
+        raw_segments = predicted[0] if predicted else []
+        timeline = [
+            _parse_sortformer_segment(item)
+            for item in raw_segments
+        ]
+        timeline = [item for item in timeline if item["end"] > item["start"]]
+        if not timeline:
+            raise RuntimeError("Sortformer returned no speaker segments")
+        timeline.sort(key=lambda item: (item["start"], item["end"]))
+        self.last_run = {
+            "device": self.device,
+            "batch_size_used": 1,
+            "timeline_intervals": len(timeline),
+            "detected_speakers": len({item["speaker"] for item in timeline}),
+            "streaming_configuration": "30.4_second_high_accuracy",
+        }
+        return timeline
+
+    def assign(
+        self,
+        source: Path,
+        audio: Any,
+        result: dict[str, Any],
+        min_speakers: Optional[int],
+        max_speakers: Optional[int],
+    ) -> dict[str, Any]:
+        del source, min_speakers, max_speakers
+        import pandas as pd
+        import whisperx
+
+        timeline = self.diarize(audio)
+        frame = pd.DataFrame(
+            [
+                {
+                    "start": item["start"],
+                    "end": item["end"],
+                    "speaker": item["speaker"],
+                }
+                for item in timeline
+            ]
+        )
+        assigned = whisperx.assign_word_speakers(frame, result)
+        assigned["speaker_timeline"] = [dict(item) for item in timeline]
+        assigned["speaker_assignment_timeline"] = [dict(item) for item in timeline]
+        return assigned
+
+
+def _timeline_overlap(
+    left: dict[str, Any], right: dict[str, Any]
+) -> float:
+    return max(
+        0.0,
+        min(float(left["end"]), float(right["end"]))
+        - max(float(left["start"]), float(right["start"])),
+    )
+
+
+def _map_secondary_timeline(
+    primary: list[dict[str, Any]], secondary: list[dict[str, Any]]
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    import numpy as np
+    from scipy.optimize import linear_sum_assignment
+
+    primary_speakers = sorted({str(item["speaker"]) for item in primary})
+    secondary_speakers = sorted({str(item["speaker"]) for item in secondary})
+    if not primary_speakers or not secondary_speakers:
+        return [], []
+    matrix = np.zeros(
+        (len(secondary_speakers), len(primary_speakers)), dtype=np.float64
+    )
+    secondary_indexes = {
+        speaker: index for index, speaker in enumerate(secondary_speakers)
+    }
+    primary_indexes = {
+        speaker: index for index, speaker in enumerate(primary_speakers)
+    }
+    for secondary_item in secondary:
+        for primary_item in primary:
+            matrix[
+                secondary_indexes[str(secondary_item["speaker"])],
+                primary_indexes[str(primary_item["speaker"])],
+            ] += _timeline_overlap(secondary_item, primary_item)
+    rows, columns = linear_sum_assignment(-matrix)
+    mapping: dict[str, str] = {}
+    reports: list[dict[str, Any]] = []
+    for row, column in zip(rows.tolist(), columns.tolist(), strict=True):
+        overlap = float(matrix[row, column])
+        if overlap <= 0.0:
+            continue
+        secondary_speaker = secondary_speakers[row]
+        primary_speaker = primary_speakers[column]
+        total = sum(
+            max(0.0, float(item["end"]) - float(item["start"]))
+            for item in secondary
+            if str(item["speaker"]) == secondary_speaker
+        )
+        mapping[secondary_speaker] = primary_speaker
+        reports.append(
+            {
+                "sortformer_speaker": secondary_speaker,
+                "primary_speaker": primary_speaker,
+                "overlap_seconds": round(overlap, 3),
+                "overlap_fraction": round(overlap / max(total, 1e-8), 4),
+            }
+        )
+    mapped = [
+        {
+            "start": float(item["start"]),
+            "end": float(item["end"]),
+            "speaker": mapping.get(str(item["speaker"])),
+            "sortformer_speaker": str(item["speaker"]),
+            "model_speaker": item.get("model_speaker"),
+        }
+        for item in secondary
+    ]
+    return mapped, reports
+
+
+def _annotate_sortformer_words(
+    result: dict[str, Any], timeline: list[dict[str, Any]]
+) -> tuple[int, int]:
+    annotated = 0
+    agreements = 0
+    for segment in result.get("segments") or []:
+        for word in segment.get("words") or []:
+            if word.get("start") is None or word.get("end") is None:
+                continue
+            candidates: dict[str, float] = {}
+            raw_labels: dict[str, float] = {}
+            for item in timeline:
+                overlap = _timeline_overlap(
+                    {"start": word["start"], "end": word["end"]}, item
+                )
+                mapped = item.get("speaker")
+                if overlap <= 0.0 or not mapped:
+                    continue
+                candidates[str(mapped)] = candidates.get(str(mapped), 0.0) + overlap
+                raw = str(item.get("sortformer_speaker") or "")
+                raw_labels[raw] = raw_labels.get(raw, 0.0) + overlap
+            if not candidates:
+                continue
+            speaker = max(candidates, key=candidates.get)
+            word["sortformer_speaker"] = speaker
+            word["sortformer_model_speaker"] = max(raw_labels, key=raw_labels.get)
+            annotated += 1
+            if speaker == str(word.get("speaker")):
+                agreements += 1
+    return annotated, agreements
+
+
+class PyannoteSortformerEnsemble:
+    """Keep pyannote primary and add Sortformer as an independent second opinion."""
+
+    name = "pyannote-community-1+nvidia-sortformer-v2.1"
+    model_name = (
+        "pyannote/speaker-diarization-community-1 + "
+        f"{SORTFORMER_MODEL}"
+    )
+
+    def __init__(
+        self,
+        token: str,
+        device: str,
+        batch_size: int = 4,
+        primary: Any = None,
+        secondary: Any = None,
+    ) -> None:
+        self.primary = primary or PyannoteDiarizer(token, device, batch_size)
+        self.secondary = secondary or SortformerDiarizer(device)
+        self.device = device
+        self.last_run: dict[str, Any] = {}
+
+    def assign(
+        self,
+        source: Path,
+        audio: Any,
+        result: dict[str, Any],
+        min_speakers: Optional[int],
+        max_speakers: Optional[int],
+    ) -> dict[str, Any]:
+        assigned = self.primary.assign(
+            source, audio, result, min_speakers, max_speakers
+        )
+        primary_timeline = list(
+            assigned.get("speaker_assignment_timeline")
+            or assigned.get("speaker_timeline")
+            or []
+        )
+        try:
+            secondary_timeline = self.secondary.diarize(audio)
+            mapped, mappings = _map_secondary_timeline(
+                primary_timeline, secondary_timeline
+            )
+            annotated, agreements = _annotate_sortformer_words(assigned, mapped)
+            assigned["sortformer_timeline"] = mapped
+            assigned["diarization_ensemble"] = {
+                "enabled": True,
+                "primary_model": getattr(self.primary, "model_name", None),
+                "secondary_model": getattr(self.secondary, "model_name", None),
+                "secondary_available": True,
+                "speaker_mappings": mappings,
+                "annotated_words": annotated,
+                "agreement_words": agreements,
+                "agreement_fraction": round(
+                    agreements / max(annotated, 1), 4
+                ),
+            }
+            secondary_error = None
+        except Exception as exc:
+            secondary_error = f"{type(exc).__name__}: {str(exc)}"[:1000]
+            assigned["diarization_ensemble"] = {
+                "enabled": True,
+                "primary_model": getattr(self.primary, "model_name", None),
+                "secondary_model": getattr(self.secondary, "model_name", None),
+                "secondary_available": False,
+                "secondary_error": secondary_error,
+            }
+        self.last_run = {
+            "device": self.device,
+            "primary": getattr(self.primary, "last_run", {}),
+            "secondary": getattr(self.secondary, "last_run", {}),
+            "secondary_error": secondary_error,
+        }
+        return assigned
+
+
 def _cosine(left: Any, right: Any) -> float:
     import numpy as np
 
@@ -1032,6 +1342,57 @@ def _sentence_continues(left: dict[str, Any], right: dict[str, Any]) -> bool:
     return bool(first_letter and first_letter.islower())
 
 
+def _sentence_ends(word: dict[str, Any]) -> bool:
+    text = str(word.get("word") or word.get("text") or "").strip()
+    core = text.rstrip("\"')]} ")
+    return bool(core and core[-1] in ".!?")
+
+
+def _lexical_utterances(result: dict[str, Any]) -> list[dict[str, Any]]:
+    """Group aligned English words without using their diarization labels."""
+    entries: list[tuple[int, dict[str, Any]]] = []
+    for segment_index, segment in enumerate(result.get("segments") or []):
+        for word in segment.get("words") or []:
+            if word.get("start") is None or word.get("end") is None:
+                continue
+            text = str(word.get("word") or word.get("text") or "").strip()
+            if not text or not any(character.isalnum() for character in text):
+                continue
+            entries.append((segment_index, word))
+    entries.sort(key=lambda item: (float(item[1]["start"]), float(item[1]["end"])))
+
+    utterances: list[dict[str, Any]] = []
+    group: list[tuple[int, dict[str, Any]]] = []
+
+    def flush() -> None:
+        if not group:
+            return
+        utterances.append(
+            {
+                "start": float(group[0][1]["start"]),
+                "end": float(group[-1][1]["end"]),
+                "words": [word for _, word in group],
+                "segment_indexes": {index for index, _ in group},
+            }
+        )
+
+    for segment_index, word in entries:
+        if group:
+            previous = group[-1][1]
+            gap = max(0.0, float(word["start"]) - float(previous["end"]))
+            duration = float(previous["end"]) - float(group[0][1]["start"])
+            if (
+                gap > SPEAKER_REFINEMENT_UTTERANCE_GAP_SECONDS
+                or _sentence_ends(previous)
+                or duration >= SPEAKER_REFINEMENT_UTTERANCE_MAX_SECONDS
+            ):
+                flush()
+                group = []
+        group.append((segment_index, word))
+    flush()
+    return utterances
+
+
 def _overlap_intervals(timeline: list[dict[str, Any]]) -> list[tuple[float, float]]:
     """Collect regions where the raw diarizer reports simultaneous speakers."""
     entries = sorted(
@@ -1193,14 +1554,181 @@ class SpeakerIdentityEncoder:
             and item.get("embedding")
         }
         corrections: list[dict[str, Any]] = []
+        protected_intervals: list[tuple[float, float]] = []
         evaluated_candidates: list[dict[str, Any]] = []
         candidates_examined = 0
+
+        if english_alignment:
+            for utterance in _lexical_utterances(result):
+                utterance_start = float(utterance["start"])
+                utterance_end = float(utterance["end"])
+                utterance_duration = utterance_end - utterance_start
+                if (
+                    utterance_duration < 0.35
+                    or utterance_duration
+                    > SPEAKER_REFINEMENT_UTTERANCE_MAX_SECONDS
+                    or _interval_overlap_seconds(
+                        utterance_start, utterance_end, overlap_regions
+                    )
+                    > min(0.12, utterance_duration * 0.15)
+                ):
+                    continue
+
+                label_runs: list[dict[str, Any]] = []
+                for word in utterance["words"]:
+                    speaker = str(word.get("speaker") or "SPEAKER_UNKNOWN")
+                    if speaker not in prototypes:
+                        label_runs = []
+                        break
+                    if label_runs and label_runs[-1]["speaker"] == speaker:
+                        label_runs[-1]["words"].append(word)
+                        label_runs[-1]["end"] = float(word["end"])
+                    else:
+                        label_runs.append(
+                            {
+                                "speaker": speaker,
+                                "words": [word],
+                                "start": float(word["start"]),
+                                "end": float(word["end"]),
+                            }
+                        )
+                if (
+                    len(label_runs) != 3
+                    or label_runs[0]["speaker"] != label_runs[2]["speaker"]
+                    or label_runs[0]["speaker"] == label_runs[1]["speaker"]
+                ):
+                    continue
+
+                target = str(label_runs[0]["speaker"])
+                original = str(label_runs[1]["speaker"])
+                middle = label_runs[1]
+                embedding = self._encode_interval(
+                    audio, utterance_start, utterance_end
+                )
+                if embedding is None:
+                    continue
+                candidates_examined += 1
+                scores = {
+                    speaker: cosine_similarity(embedding, item["embedding"])
+                    for speaker, item in prototypes.items()
+                }
+                best = max(scores, key=scores.get)
+                target_score = scores[target]
+                original_score = scores[original]
+                runner_up = max(
+                    (score for speaker, score in scores.items() if speaker != target),
+                    default=-1.0,
+                )
+                margin = target_score - runner_up
+
+                secondary_durations: dict[str, float] = {}
+                for word in utterance["words"]:
+                    secondary = word.get("sortformer_speaker")
+                    if not secondary:
+                        continue
+                    word_duration = max(
+                        0.0, float(word["end"]) - float(word["start"])
+                    )
+                    secondary_durations[str(secondary)] = (
+                        secondary_durations.get(str(secondary), 0.0)
+                        + word_duration
+                    )
+                secondary_consensus = None
+                secondary_fraction = 0.0
+                if secondary_durations:
+                    secondary_total = sum(secondary_durations.values())
+                    secondary_consensus = max(
+                        secondary_durations, key=secondary_durations.get
+                    )
+                    secondary_fraction = (
+                        secondary_durations[secondary_consensus]
+                        / max(secondary_total, 1e-8)
+                    )
+                    if secondary_fraction < 0.65:
+                        secondary_consensus = None
+
+                required_similarity = SPEAKER_REFINEMENT_UTTERANCE_MIN_SIMILARITY
+                required_margin = SPEAKER_REFINEMENT_UTTERANCE_MIN_MARGIN
+                if secondary_consensus == target:
+                    required_similarity = 0.45
+                    required_margin = 0.10
+                audit = {
+                    "strategy": "bracketed_utterance",
+                    "start": round(utterance_start, 3),
+                    "end": round(utterance_end, 3),
+                    "duration_seconds": round(utterance_duration, 3),
+                    "original_local_speaker": original,
+                    "best_local_speaker": best,
+                    "bracketing_local_speaker": target,
+                    "original_similarity": round(original_score, 4),
+                    "best_similarity": round(scores[best], 4),
+                    "target_similarity": round(target_score, 4),
+                    "similarity_margin": round(margin, 4),
+                    "required_similarity": round(required_similarity, 4),
+                    "required_margin": round(required_margin, 4),
+                    "sortformer_consensus": secondary_consensus,
+                    "sortformer_consensus_fraction": round(secondary_fraction, 4),
+                }
+                if secondary_consensus not in (None, target):
+                    audit["decision"] = "abstained_sortformer_disagreement"
+                    evaluated_candidates.append(audit)
+                    protected_intervals.append(
+                        (float(middle["start"]), float(middle["end"]))
+                    )
+                    continue
+                if (
+                    best != target
+                    or target_score < required_similarity
+                    or margin < required_margin
+                ):
+                    audit["decision"] = "abstained_below_confidence_threshold"
+                    evaluated_candidates.append(audit)
+                    continue
+
+                audit["decision"] = "corrected"
+                evaluated_candidates.append(audit)
+                corrections.append(
+                    {
+                        "strategy": "bracketed_utterance",
+                        "start": round(float(middle["start"]), 3),
+                        "end": round(float(middle["end"]), 3),
+                        "duration_seconds": round(
+                            float(middle["end"]) - float(middle["start"]), 3
+                        ),
+                        "evidence_start": round(utterance_start, 3),
+                        "evidence_end": round(utterance_end, 3),
+                        "from_local_speaker": original,
+                        "to_local_speaker": target,
+                        "original_similarity": round(original_score, 4),
+                        "refined_similarity": round(target_score, 4),
+                        "similarity_margin": round(margin, 4),
+                        "context_support": 2,
+                        "sandwiched_sentence_continuation": True,
+                        "sentence_seam_continuation": True,
+                        "sentence_seam_support": 2,
+                        "sortformer_consensus": secondary_consensus,
+                        "sortformer_consensus_fraction": round(
+                            secondary_fraction, 4
+                        ),
+                        "word_count": len(middle["words"]),
+                        "run": {
+                            "words": middle["words"],
+                            "segment_indexes": utterance["segment_indexes"],
+                        },
+                    }
+                )
+
+        accepted_intervals = [
+            (float(item["start"]), float(item["end"])) for item in corrections
+        ] + protected_intervals
         for index, run in enumerate(runs):
             start = float(run["start"])
             end = float(run["end"])
             duration = end - start
             original = str(run["speaker"])
             if duration < 0.35 or original not in prototypes or len(prototypes) < 2:
+                continue
+            if _interval_overlap_seconds(start, end, accepted_intervals) > 0.0:
                 continue
             overlap_seconds = _interval_overlap_seconds(start, end, overlap_regions)
             if overlap_seconds > min(0.12, duration * 0.15):
@@ -1266,6 +1794,7 @@ class SpeakerIdentityEncoder:
             original_score = scores.get(original, -1.0)
             refined_score = scores.get(refined, -1.0)
             audit = {
+                "strategy": "word_run",
                 "start": round(start, 3),
                 "end": round(end, 3),
                 "duration_seconds": round(duration, 3),
@@ -1349,6 +1878,7 @@ class SpeakerIdentityEncoder:
             evaluated_candidates.append(audit)
             corrections.append(
                 {
+                    "strategy": "word_run",
                     "start": round(start, 3),
                     "end": round(end, 3),
                     "duration_seconds": round(duration, 3),
@@ -1397,6 +1927,7 @@ class SpeakerIdentityEncoder:
                     "refined_similarity": correction["refined_similarity"],
                     "similarity_margin": correction["similarity_margin"],
                     "context_support": correction["context_support"],
+                    "strategy": correction["strategy"],
                     "sandwiched_sentence_continuation": correction[
                         "sandwiched_sentence_continuation"
                     ],
@@ -1480,6 +2011,18 @@ class SpeakerIdentityEncoder:
                     SPEAKER_REFINEMENT_MICRO_MIN_SIMILARITY
                 ),
                 "micro_minimum_margin": SPEAKER_REFINEMENT_MICRO_MIN_MARGIN,
+                "utterance_gap_seconds": (
+                    SPEAKER_REFINEMENT_UTTERANCE_GAP_SECONDS
+                ),
+                "utterance_maximum_seconds": (
+                    SPEAKER_REFINEMENT_UTTERANCE_MAX_SECONDS
+                ),
+                "utterance_minimum_similarity": (
+                    SPEAKER_REFINEMENT_UTTERANCE_MIN_SIMILARITY
+                ),
+                "utterance_minimum_margin": (
+                    SPEAKER_REFINEMENT_UTTERANCE_MIN_MARGIN
+                ),
             },
             "corrections": corrections,
             "raw_diarization_preserved": True,

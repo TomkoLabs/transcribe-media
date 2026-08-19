@@ -183,7 +183,10 @@ def expected_outputs(
 ) -> dict[str, Path]:
     transcript_base = output_base(source, source_dir, transcript_dir)
     review_base = output_base(source, source_dir, review_dir)
-    outputs = {"txt": output_path(transcript_base, "txt")}
+    outputs = {
+        "txt": output_path(transcript_base, "txt"),
+        "detailed_txt": output_path(review_base, "detailed.txt"),
+    }
     outputs.update(
         {
             format_name: output_path(review_base, format_name)

@@ -7,19 +7,28 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
+import torch
+
 from transcribe_media_app import cli
-from transcribe_media_app.analysis import build_turns, normalize_segments
+from transcribe_media_app.analysis import (
+    annotate_speaker_attribution,
+    build_turns,
+    normalize_segments,
+)
 from transcribe_media_app.backends import (
     SUPPORTED_CTRANSLATE2_VERSION,
     Emotion2VecToneEstimator,
     PyannoteDiarizer,
+    PyannoteSortformerEnsemble,
     SpeakerIdentityEncoder,
+    SortformerDiarizer,
     WhisperXBackend,
     _exclusive_intervals,
     _recognized_speech_intervals,
 )
 from transcribe_media_app.renderers import (
     format_timestamp,
+    render_detailed_txt,
     render_srt,
     render_txt,
     render_vtt,
@@ -48,7 +57,7 @@ class FormattingTests(unittest.TestCase):
         self.assertEqual(format_timestamp(1.2, ","), "00:00:01,200")
         self.assertEqual(format_timestamp(float("nan")), "00:00:00.000")
 
-    def test_primary_txt_separates_observation_from_tone(self):
+    def test_detailed_txt_separates_observation_from_tone(self):
         payload = {
             "source": {"relative_path": "Café clip.mp4"},
             "language": {"output": "en", "task": "transcribe"},
@@ -65,6 +74,7 @@ class FormattingTests(unittest.TestCase):
                     "speaker": "SPEAKER_00",
                     "text": "Hello there.",
                     "observations": [{"label": "fast speech"}],
+                    "speaker_attribution": {"status": "uncertain"},
                     "tone": {
                         "model": "test-model",
                         "scores": [{"label": "neutral", "probability": 0.6}],
@@ -72,13 +82,16 @@ class FormattingTests(unittest.TestCase):
                 }
             ],
         }
-        text = render_txt(payload)
+        text = render_detailed_txt(payload)
         self.assertIn("[00:00:01.000 - 00:00:02.500] SPEAKER_00:", text)
         self.assertIn("[Observed: fast speech]", text)
-        self.assertIn("[Tone approx: neutral 60%; model: test-model]", text)
+        self.assertIn("Tone model: test-model", text)
+        self.assertIn("[Tone approx: neutral 60%]", text)
+        self.assertNotIn("neutral 60%; model:", text)
+        self.assertIn("[Speaker attribution: uncertain", text)
         self.assertIn("not facts about emotion", text)
 
-    def test_primary_txt_distinguishes_model_abstention_from_failure(self):
+    def test_detailed_txt_distinguishes_model_abstention_from_failure(self):
         tone = {
             "model": "test-model",
             "scores": [
@@ -118,15 +131,14 @@ class FormattingTests(unittest.TestCase):
                 }
             ],
         }
-        text = render_txt(payload)
+        text = render_detailed_txt(payload)
         self.assertIn(
-            "[Tone approx: varies across 2 windows; unclassified 64%, angry 26%; "
-            "model: test-model]",
+            "[Tone approx: varies across 2 windows; unclassified 64%, angry 26%]",
             text,
         )
         self.assertNotIn("Tone approx: unknown", text)
 
-    def test_primary_txt_separates_active_speakers_from_registry_history(self):
+    def test_detailed_txt_separates_active_speakers_from_registry_history(self):
         payload = {
             "source": {"relative_path": "clip.mp4"},
             "language": {"output": "en", "task": "transcribe"},
@@ -151,7 +163,7 @@ class FormattingTests(unittest.TestCase):
             "speaker_refinement": {"corrections_applied": 2},
             "turns": [],
         }
-        text = render_txt(payload)
+        text = render_detailed_txt(payload)
         self.assertIn(
             "Active speakers in this recording: 3 (VOICE_0001, VOICE_0004, VOICE_0006)",
             text,
@@ -161,6 +173,121 @@ class FormattingTests(unittest.TestCase):
         )
         self.assertIn("Speaker refinement: 2 label correction(s)", text)
         self.assertIn("Speaker labels are probabilistic", text)
+
+    def test_primary_txt_is_condensed_and_selectively_preserves_context(self):
+        payload = {
+            "source": {"relative_path": "session.mp4"},
+            "language": {"output": "en", "task": "transcribe"},
+            "processing": {"degraded_stages": []},
+            "speaker_identity": {
+                "active_speaker_ids": ["VOICE_0001", "VOICE_0002"]
+            },
+            "turns": [
+                {
+                    "start": 1.0,
+                    "end": 4.0,
+                    "speaker": "VOICE_0001",
+                    "text": "I need you to hear me.",
+                    "pause_before_seconds": 0.0,
+                    "observations": [
+                        {"label": "elevated volume"},
+                        {"label": "fast speech"},
+                    ],
+                    "speaker_attribution": {"status": "assigned"},
+                    "tone": {
+                        "kind": "approximate_model_estimate",
+                        "model": "emotion-model",
+                        "scores": [
+                            {"label": "angry", "probability": 0.82},
+                            {"label": "neutral", "probability": 0.10},
+                        ],
+                    },
+                },
+                {
+                    "start": 4.1,
+                    "end": 6.0,
+                    "speaker": "VOICE_0001",
+                    "text": "This matters to me.",
+                    "pause_before_seconds": 0.1,
+                    "observations": [],
+                    "speaker_attribution": {"status": "assigned"},
+                    "tone": {
+                        "kind": "approximate_model_estimate",
+                        "model": "emotion-model",
+                        "scores": [
+                            {"label": "angry", "probability": 0.78},
+                            {"label": "unknown", "probability": 0.12},
+                        ],
+                    },
+                },
+                {
+                    "start": 6.1,
+                    "end": 7.0,
+                    "speaker": "VOICE_0002",
+                    "text": "I know.",
+                    "pause_before_seconds": 0.1,
+                    "observations": [{"label": "overlap"}],
+                    "speaker_attribution": {"status": "uncertain"},
+                    "tone": {
+                        "kind": "approximate_model_estimate",
+                        "model": "emotion-model",
+                        "scores": [
+                            {"label": "neutral", "probability": 0.91},
+                            {"label": "sad", "probability": 0.04},
+                        ],
+                    },
+                },
+            ],
+        }
+        text = render_txt(payload)
+        self.assertNotIn("00:00:", text)
+        self.assertNotIn("emotion-model", text)
+        self.assertEqual(text.count("VOICE_0001:"), 1)
+        self.assertIn(
+            "I need you to hear me. This matters to me.", text
+        )
+        self.assertIn("[Context: elevated volume]", text)
+        self.assertNotIn("fast speech", text)
+        self.assertIn("[Vocal tone estimate: angry]", text)
+        self.assertIn("VOICE_0002 [speaker attribution uncertain]:", text)
+        self.assertIn("[Context: overlapping speech]", text)
+        self.assertNotIn("Vocal tone estimate: neutral", text)
+
+    def test_condensed_tone_reports_strong_temporal_change_without_scores(self):
+        payload = {
+            "source": {"relative_path": "session.wav"},
+            "language": {"output": "en"},
+            "processing": {},
+            "turns": [
+                {
+                    "speaker": "VOICE_0001",
+                    "text": "The presentation changed during this turn.",
+                    "tone": {
+                        "kind": "approximate_model_estimate",
+                        "model": "test-model",
+                        "temporal_variation": True,
+                        "windows": [
+                            {
+                                "scores": [
+                                    {"label": "sad", "probability": 0.82},
+                                    {"label": "neutral", "probability": 0.08},
+                                ]
+                            },
+                            {
+                                "scores": [
+                                    {"label": "angry", "probability": 0.76},
+                                    {"label": "unknown", "probability": 0.10},
+                                ]
+                            },
+                        ],
+                    },
+                }
+            ],
+        }
+        text = render_txt(payload)
+        self.assertIn("[Vocal tone estimate: varied (sad -> angry)]", text)
+        self.assertNotIn("82%", text)
+        self.assertNotIn("test-model", text)
 
     def test_srt_and_vtt_include_speaker_and_timestamp(self):
         segments = [{"start": 1, "end": 2.5, "speaker": "SPEAKER_00", "text": "Hi"}]
@@ -199,6 +326,9 @@ class StorageTests(unittest.TestCase):
             ("json", "srt"),
         )
         self.assertEqual(outputs["txt"], Path("/txt/clip.mp4.txt"))
+        self.assertEqual(
+            outputs["detailed_txt"], Path("/review/clip.mp4.detailed.txt")
+        )
         self.assertEqual(outputs["json"], Path("/review/clip.mp4.json"))
         self.assertEqual(outputs["srt"], Path("/review/clip.mp4.srt"))
 
@@ -215,8 +345,10 @@ class StorageTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             txt = root / "clip.txt"
+            detailed = root / "clip.detailed.txt"
             structured = root / "clip.json"
             txt.write_text("transcript", encoding="utf-8")
+            detailed.write_text("detailed transcript", encoding="utf-8")
             structured.write_text(
                 json.dumps(
                     {
@@ -235,10 +367,19 @@ class StorageTests(unittest.TestCase):
                 "settings_hash": "settings",
                 "retry_recommended": False,
             }
-            outputs = {"txt": txt, "json": structured}
+            outputs = {
+                "txt": txt,
+                "detailed_txt": detailed,
+                "json": structured,
+            }
             self.assertTrue(
                 state_is_complete(state, fingerprint, "settings", outputs)[0]
             )
+            detailed.unlink()
+            self.assertFalse(
+                state_is_complete(state, fingerprint, "settings", outputs)[0]
+            )
+            detailed.write_text("detailed transcript", encoding="utf-8")
             self.assertFalse(
                 state_is_complete(
                     state, {**fingerprint, "size": 11}, "settings", outputs
@@ -370,6 +511,53 @@ class AnalysisTests(unittest.TestCase):
         turns = build_turns(segments)
         self.assertAlmostEqual(turns[0]["overlaps"][0]["duration_seconds"], 1)
         self.assertEqual(turns[1]["interruption_of"], turns[0]["id"])
+
+    def test_sortformer_disagreement_marks_attribution_uncertain(self):
+        turns = [
+            {
+                "start": 1.0,
+                "end": 2.0,
+                "speaker": "VOICE_0002",
+                "words": [
+                    {
+                        "start": 1.0,
+                        "end": 1.7,
+                        "local_speaker": "SPEAKER_01",
+                        "sortformer_speaker": "SPEAKER_00",
+                    }
+                ],
+            }
+        ]
+        annotate_speaker_attribution(turns)
+        attribution = turns[0]["speaker_attribution"]
+        self.assertEqual(attribution["status"], "uncertain")
+        self.assertIn("sortformer_majority_disagrees", attribution["reasons"])
+        self.assertEqual(attribution["assigned_speaker"], "VOICE_0002")
+
+    def test_unresolved_sentence_seam_marks_attribution_uncertain(self):
+        turns = [
+            {
+                "start": 9.434,
+                "end": 11.975,
+                "speaker": "VOICE_0002",
+                "words": [],
+            }
+        ]
+        refinement = {
+            "evaluated_candidates": [
+                {
+                    "strategy": "word_run",
+                    "start": 9.434,
+                    "end": 11.975,
+                    "decision": "abstained_below_confidence_threshold",
+                    "sentence_seam_continuation": True,
+                }
+            ]
+        }
+        annotate_speaker_attribution(turns, refinement)
+        attribution = turns[0]["speaker_attribution"]
+        self.assertEqual(attribution["status"], "uncertain")
+        self.assertIn("unresolved_sentence_continuation", attribution["reasons"])
 
 
 class SpeakerIdentityTests(unittest.TestCase):
@@ -1019,6 +1207,70 @@ class SpeakerRefinementTests(unittest.TestCase):
             ],
         }
 
+    @staticmethod
+    def _fragmented_reply_result(sortformer_speaker=None):
+        reply_words = [
+            {
+                "word": "I",
+                "start": 9.452,
+                "end": 9.532,
+                "speaker": "SPEAKER_01",
+            },
+            {
+                "word": "just told",
+                "start": 9.572,
+                "end": 9.992,
+                "speaker": "SPEAKER_00",
+            },
+            {
+                "word": "you.",
+                "start": 10.212,
+                "end": 10.412,
+                "speaker": "SPEAKER_01",
+            },
+        ]
+        if sortformer_speaker:
+            for word in reply_words:
+                word["sortformer_speaker"] = sortformer_speaker
+        return {
+            "language": "en",
+            "segments": [
+                {
+                    "start": 5.95,
+                    "end": 9.052,
+                    "text": "Tell me what...",
+                    "speaker": "SPEAKER_00",
+                    "words": [
+                        {
+                            "word": "Tell me what...",
+                            "start": 5.95,
+                            "end": 9.052,
+                            "speaker": "SPEAKER_00",
+                        }
+                    ],
+                },
+                {
+                    "start": 9.452,
+                    "end": 10.412,
+                    "text": "I just told you.",
+                    "speaker": "SPEAKER_00",
+                    "words": reply_words,
+                },
+            ],
+            "speaker_timeline": [
+                {"start": 5.95, "end": 9.052, "speaker": "SPEAKER_00"},
+                {"start": 9.452, "end": 9.532, "speaker": "SPEAKER_01"},
+                {"start": 9.572, "end": 9.992, "speaker": "SPEAKER_00"},
+                {"start": 10.212, "end": 10.412, "speaker": "SPEAKER_01"},
+            ],
+            "speaker_assignment_timeline": [
+                {"start": 5.95, "end": 9.052, "speaker": "SPEAKER_00"},
+                {"start": 9.452, "end": 9.532, "speaker": "SPEAKER_01"},
+                {"start": 9.572, "end": 9.992, "speaker": "SPEAKER_00"},
+                {"start": 10.212, "end": 10.412, "speaker": "SPEAKER_01"},
+            ],
+        }
+
     def test_short_acoustic_misassignment_is_corrected_and_audited(self):
         result = self._result()
         report = self._encoder([0.99, 0.01]).refine([], result)
@@ -1157,6 +1409,119 @@ class SpeakerRefinementTests(unittest.TestCase):
         self.assertEqual(result["segments"][1]["speaker"], "SPEAKER_01")
         encoder._encode_interval.assert_not_called()
 
+    def test_fragmented_a_b_a_reply_is_classified_as_one_utterance(self):
+        result = self._fragmented_reply_result()
+        report = self._encoder([0.01, 0.99]).refine([], result)
+        self.assertEqual(report["corrections_applied"], 1)
+        correction = report["corrections"][0]
+        self.assertEqual(correction["strategy"], "bracketed_utterance")
+        self.assertEqual(correction["from_local_speaker"], "SPEAKER_00")
+        self.assertEqual(correction["to_local_speaker"], "SPEAKER_01")
+        reply = result["segments"][1]
+        self.assertEqual({word["speaker"] for word in reply["words"]}, {"SPEAKER_01"})
+        self.assertEqual(reply["speaker"], "SPEAKER_01")
+
+    def test_fragmented_reply_abstains_when_sortformer_disagrees(self):
+        result = self._fragmented_reply_result("SPEAKER_00")
+        report = self._encoder([0.01, 0.99]).refine([], result)
+        self.assertEqual(report["corrections_applied"], 0)
+        candidate = next(
+            item
+            for item in report["evaluated_candidates"]
+            if item["strategy"] == "bracketed_utterance"
+        )
+        self.assertEqual(candidate["decision"], "abstained_sortformer_disagreement")
+
+
+class SortformerTests(unittest.TestCase):
+    class FakeModel:
+        def __init__(self):
+            self.device = None
+            self.eval_called = False
+
+        def to(self, device):
+            self.device = str(device)
+            return self
+
+        def eval(self):
+            self.eval_called = True
+            return self
+
+        @staticmethod
+        def diarize(*, audio, batch_size, sample_rate):
+            del audio
+            assert batch_size == 1
+            assert sample_rate == 16_000
+            return [["0.00 1.00 speaker_0", "1.00 2.00 speaker_1"]]
+
+    def test_sortformer_parses_nemo_segments(self):
+        model = self.FakeModel()
+        diarizer = SortformerDiarizer("cpu", model=model)
+        timeline = diarizer.diarize([0.1] * 32_000)
+        self.assertTrue(model.eval_called)
+        self.assertEqual(model.device, "cpu")
+        self.assertEqual(
+            [item["speaker"] for item in timeline],
+            ["SPEAKER_00", "SPEAKER_01"],
+        )
+        self.assertEqual(diarizer.last_run["detected_speakers"], 2)
+
+    def test_ensemble_maps_sortformer_labels_and_annotates_words(self):
+        class Primary:
+            model_name = "test-primary"
+            last_run = {"device": "cpu"}
+
+            @staticmethod
+            def assign(source, audio, result, min_speakers, max_speakers):
+                del source, audio, min_speakers, max_speakers
+                result["speaker_timeline"] = [
+                    {"start": 0.0, "end": 1.0, "speaker": "SPEAKER_A"},
+                    {"start": 1.0, "end": 2.0, "speaker": "SPEAKER_B"},
+                ]
+                result["speaker_assignment_timeline"] = [
+                    dict(item) for item in result["speaker_timeline"]
+                ]
+                return result
+
+        secondary = SortformerDiarizer("cpu", model=self.FakeModel())
+        ensemble = PyannoteSortformerEnsemble(
+            "token",
+            "cpu",
+            primary=Primary(),
+            secondary=secondary,
+        )
+        result = {
+            "segments": [
+                {
+                    "start": 0.0,
+                    "end": 2.0,
+                    "speaker": "SPEAKER_A",
+                    "words": [
+                        {
+                            "word": "first",
+                            "start": 0.1,
+                            "end": 0.8,
+                            "speaker": "SPEAKER_A",
+                        },
+                        {
+                            "word": "second",
+                            "start": 1.1,
+                            "end": 1.8,
+                            "speaker": "SPEAKER_B",
+                        },
+                    ],
+                }
+            ]
+        }
+        assigned = ensemble.assign(Path("clip.wav"), [0.1] * 32_000, result, 2, 2)
+        words = assigned["segments"][0]["words"]
+        self.assertEqual(words[0]["sortformer_speaker"], "SPEAKER_A")
+        self.assertEqual(words[1]["sortformer_speaker"], "SPEAKER_B")
+        report = assigned["diarization_ensemble"]
+        self.assertTrue(report["secondary_available"])
+        self.assertEqual(report["agreement_fraction"], 1.0)
+        self.assertEqual(len(report["speaker_mappings"]), 2)
+
 
 class ConfigurationTests(unittest.TestCase):
     def test_exact_speaker_count_sets_both_diarization_bounds(self):
@@ -1188,6 +1553,30 @@ class ConfigurationTests(unittest.TestCase):
         )
         identity = cli.settings_identity(settings, runtime)
         self.assertEqual(identity["program_version"], cli.__version__)
+
+    def test_auto_diarization_uses_ensemble_on_cuda_when_installed(self):
+        args = cli.build_parser().parse_args(
+            ["--min-speakers", "2", "--max-speakers", "2"]
+        )
+        with (
+            mock.patch.object(cli, "_available", return_value=True),
+            mock.patch.object(cli, "_cuda_available", return_value=True),
+        ):
+            diarization, _tone, _messages = cli.resolve_analysis_backends(
+                args, "hf_token"
+            )
+        self.assertEqual(diarization, "ensemble")
+
+    def test_auto_diarization_uses_sortformer_without_pyannote_token(self):
+        args = cli.build_parser().parse_args(
+            ["--min-speakers", "2", "--max-speakers", "2"]
+        )
+        with (
+            mock.patch.object(cli, "_available", return_value=True),
+            mock.patch.object(cli, "_cuda_available", return_value=True),
+        ):
+            diarization, _tone, _messages = cli.resolve_analysis_backends(args, None)
+        self.assertEqual(diarization, "sortformer")
 
     def test_token_round_trip_and_private_permissions(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -1477,6 +1866,12 @@ class FlowTests(unittest.TestCase):
             payload = json.loads((root / "Review" / "clip.mp4.json").read_text())
             self.assertEqual(payload["segments"][0]["words"][0]["confidence"], 0.9)
             self.assertTrue(payload["processing"]["local_processing"])
+            self.assertTrue(
+                (root / "Review" / "clip.mp4.detailed.txt").is_file()
+            )
+            condensed = (root / "Transcribed" / "clip.mp4.txt").read_text()
+            self.assertIn("ANALYSIS-READY TRANSCRIPT", condensed)
+            self.assertNotIn("00:00:", condensed)
 
     def test_corrupt_file_fails_but_next_file_completes(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -1927,11 +2322,13 @@ class DocumentationConsistencyTests(unittest.TestCase):
 
     def test_cuda_regression_workaround_is_pinned(self):
         requirements = Path("requirements.txt").read_text(encoding="utf-8")
+        gpu_requirements = Path("requirements-gpu.txt").read_text(encoding="utf-8")
         self.assertIn(
             f"ctranslate2=={SUPPORTED_CTRANSLATE2_VERSION}", requirements.splitlines()
         )
         self.assertIn("whisperx==3.8.6", requirements.splitlines())
         self.assertIn("funasr==1.4.2", requirements.splitlines())
+        self.assertIn("nemo-toolkit[asr]==2.7.3", gpu_requirements.splitlines())
 
 
 if __name__ == "__main__":

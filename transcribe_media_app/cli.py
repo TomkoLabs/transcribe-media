@@ -24,6 +24,7 @@ from . import __version__
 from .analysis import (
     AcousticAnalyzer,
     HeuristicToneEstimator,
+    annotate_speaker_attribution,
     build_turns,
     normalize_segments,
 )
@@ -31,7 +32,9 @@ from .backends import (
     SUPPORTED_CTRANSLATE2_VERSION,
     Emotion2VecToneEstimator,
     PyannoteDiarizer,
+    PyannoteSortformerEnsemble,
     SpeakerIdentityEncoder,
+    SortformerDiarizer,
     SpeechBrainEmbeddingDiarizer,
     SpeechBrainToneEstimator,
     WhisperXBackend,
@@ -239,9 +242,16 @@ def build_parser() -> argparse.ArgumentParser:
 
     parser.add_argument(
         "--diarization-backend",
-        choices=("auto", "pyannote", "speechbrain", "off"),
+        choices=(
+            "auto",
+            "ensemble",
+            "pyannote",
+            "sortformer",
+            "speechbrain",
+            "off",
+        ),
         default="auto",
-        help="anonymous speaker-label backend",
+        help="anonymous speaker-label backend; auto uses the best installed stack",
     )
     parser.add_argument(
         "--diarize", action="store_true", help="enable automatic speaker labeling"
@@ -417,6 +427,12 @@ def _validate_args(parser: argparse.ArgumentParser, args: argparse.Namespace) ->
         args.diarization_backend = "auto"
     if args.diarization_backend == "off":
         args.speaker_identity = False
+    if (
+        args.diarization_backend in {"sortformer", "ensemble"}
+        and args.max_speakers is not None
+        and args.max_speakers > 4
+    ):
+        parser.error("Sortformer v2.1 supports at most four speakers")
     if args.reset_speaker_registry and not args.speaker_identity:
         parser.error("--reset-speaker-registry requires speaker identity")
     if args.reset_speaker_registry and args.dry_run:
@@ -546,7 +562,19 @@ def resolve_runtime(args: argparse.Namespace) -> RuntimeSettings:
 
 
 def _available(module: str) -> bool:
-    return importlib.util.find_spec(module) is not None
+    try:
+        return importlib.util.find_spec(module) is not None
+    except (ImportError, ModuleNotFoundError):
+        return False
+
+
+def _cuda_available() -> bool:
+    try:
+        import torch
+
+        return bool(torch.cuda.is_available())
+    except ImportError:
+        return False
 
 
 def resolve_analysis_backends(
@@ -557,7 +585,20 @@ def resolve_analysis_backends(
     diarization = args.diarization_backend
     if diarization == "auto":
         if token:
-            diarization = "pyannote"
+            if (
+                _available("nemo")
+                and _cuda_available()
+                and max(args.min_speakers or 1, args.max_speakers or 4) <= 4
+            ):
+                diarization = "ensemble"
+            else:
+                diarization = "pyannote"
+        elif (
+            _available("nemo")
+            and _cuda_available()
+            and max(args.min_speakers or 1, args.max_speakers or 4) <= 4
+        ):
+            diarization = "sortformer"
         elif _available("speechbrain"):
             diarization = "speechbrain"
             degraded.append(
@@ -630,6 +671,7 @@ def settings_identity(
             "faster_whisper": package_version("faster-whisper"),
             "ctranslate2": package_version("ctranslate2"),
             "pyannote_audio": package_version("pyannote-audio"),
+            "nemo_toolkit": package_version("nemo-toolkit"),
             "speechbrain": package_version("speechbrain"),
             "funasr": package_version("funasr"),
             "torch": package_version("torch"),
@@ -649,6 +691,12 @@ def create_diarizer(
         if not token:
             raise RuntimeError("pyannote diarization requires a Hugging Face token")
         return PyannoteDiarizer(token, device, batch_size)
+    if name == "sortformer":
+        return SortformerDiarizer(device)
+    if name == "ensemble":
+        if not token:
+            raise RuntimeError("the pyannote+Sortformer ensemble requires a token")
+        return PyannoteSortformerEnsemble(token, device, batch_size)
     if name == "speechbrain":
         return SpeechBrainEmbeddingDiarizer(device)
     raise ValueError(f"unsupported diarization backend: {name}")
@@ -756,6 +804,11 @@ def doctor() -> int:
         return f"{torch.__version__}; CUDA available={torch.cuda.is_available()}"
 
     checks.append(_doctor_check("PyTorch arithmetic", torch_check))
+    nemo_version = package_version("nemo-toolkit")
+    print(
+        "[INFO] NVIDIA NeMo / Sortformer: "
+        f"{nemo_version or 'not installed (optional on CPU)'}"
+    )
     token = resolve_hf_token()
     token_status = "configured" if token else "not configured"
     print(f"[INFO] Higher-quality pyannote token: {token_status}")
@@ -818,7 +871,25 @@ def _exercise_models(
                 runtime.analysis_device,
                 runtime.diarization_batch_size,
             )
-            diarizer.assign(sample, audio, synthetic_result, 1, 1)
+            try:
+                diarizer.assign(sample, audio, synthetic_result, 1, 1)
+            except RuntimeError as exc:
+                if (
+                    diarization_name == "sortformer"
+                    and "returned no speaker segments" in str(exc)
+                ):
+                    pass
+                else:
+                    raise
+            secondary_error = getattr(diarizer, "last_run", {}).get(
+                "secondary_error"
+            )
+            if secondary_error and "returned no speaker segments" not in str(
+                secondary_error
+            ):
+                raise RuntimeError(
+                    f"Sortformer self-test failed: {secondary_error}"
+                )
             print(f"[OK] Diarization model exercised ({diarization_name}).")
         if (args.speaker_identity or args.speaker_refinement) and diarizer is not None:
             import numpy as np
@@ -1006,6 +1077,11 @@ def _processing_payload(
             "Token-free ECAPA diarization globally clusters recognized-speech windows "
             "and is less reliable for overlap than frame-level pyannote diarization."
         )
+    if result.get("diarization_ensemble"):
+        limitations.append(
+            "Sortformer is an independent second opinion mapped into pyannote's "
+            "recording-local labels; disagreement is retained rather than forced."
+        )
     if identity_report:
         limitations.append(
             "Persistent voice matches can abstain or be wrong under short speech, "
@@ -1053,6 +1129,8 @@ def _processing_payload(
             "speaker_assignment_timeline_original"
         ),
         "speaker_refinement": result.get("speaker_refinement"),
+        "sortformer_timeline": result.get("sortformer_timeline"),
+        "diarization_ensemble": result.get("diarization_ensemble"),
         "speaker_identity": result.get("speaker_identity"),
         "overlap_events": overlap_events,
         "limitations": limitations,
@@ -1100,6 +1178,12 @@ def process_one(
             provenance["diarization_runtime"] = getattr(
                 diarizer, "last_run", {"device": runtime.analysis_device}
             )
+            ensemble = result.get("diarization_ensemble") or {}
+            if ensemble and not ensemble.get("secondary_available", True):
+                degraded.append(
+                    "Sortformer second opinion: "
+                    f"{ensemble.get('secondary_error', 'unavailable')}"
+                )
         except Exception as exc:
             raise RuntimeError(
                 "required speaker diarization failed; no transcript was marked "
@@ -1244,6 +1328,7 @@ def process_one(
     LOG.info("[%s] stage 5/7: structure words, turns, and overlap", relative)
     segments = normalize_segments(result)
     turns = build_turns(segments)
+    annotate_speaker_attribution(turns, result.get("speaker_refinement"))
 
     if acoustic_analyzer is not None:
         LOG.info("[%s] stage 6/7: measured acoustic observations", relative)
@@ -1589,11 +1674,55 @@ def run_batch(args: argparse.Namespace) -> int:
         )
     except Exception as exc:
         initial_degraded.append(f"diarization initialization: {_safe_error(exc)}")
-        if diarization_name == "pyannote" and _available("speechbrain"):
+        if diarization_name == "ensemble" and token:
+            try:
+                diarizer = create_diarizer(
+                    "pyannote",
+                    token,
+                    runtime.analysis_device,
+                    runtime.diarization_batch_size,
+                )
+                initial_degraded.append(
+                    "diarization: Sortformer unavailable; using pyannote alone"
+                )
+            except Exception as fallback_exc:
+                initial_degraded.append(
+                    f"pyannote fallback initialization: {_safe_error(fallback_exc)}"
+                )
+                if _available("speechbrain"):
+                    try:
+                        diarizer = create_diarizer(
+                            "speechbrain", None, runtime.analysis_device
+                        )
+                        initial_degraded.append(
+                            "diarization: ensemble unavailable; using token-free "
+                            "windowed voice clustering"
+                        )
+                    except Exception as final_exc:
+                        initial_degraded.append(
+                            "diarization final fallback initialization: "
+                            f"{_safe_error(final_exc)}"
+                        )
+                        diarizer = None
+                else:
+                    diarizer = None
+        elif diarization_name == "pyannote" and _available("speechbrain"):
             try:
                 diarizer = create_diarizer("speechbrain", None, runtime.analysis_device)
                 initial_degraded.append(
                     "diarization: pyannote unavailable; using token-free "
+                    "windowed voice clustering"
+                )
+            except Exception as fallback_exc:
+                initial_degraded.append(
+                    f"diarization fallback initialization: {_safe_error(fallback_exc)}"
+                )
+                diarizer = None
+        elif diarization_name == "sortformer" and _available("speechbrain"):
+            try:
+                diarizer = create_diarizer("speechbrain", None, runtime.analysis_device)
+                initial_degraded.append(
+                    "diarization: Sortformer unavailable; using token-free "
                     "windowed voice clustering"
                 )
             except Exception as fallback_exc:
