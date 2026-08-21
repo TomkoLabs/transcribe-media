@@ -28,8 +28,8 @@ cd transcribe-media
 ./install.sh
 ```
 
-Put recordings in `./Video Source/`, then run this for a known two-person
-conversation:
+Put English recordings in `./Video Source/`, then run this for a known
+two-person conversation:
 
 ```bash
 ./transcribe-media --min-speakers 2 --max-speakers 2
@@ -196,16 +196,17 @@ creates the working directories, and validates the models. Useful diagnostics:
 ./transcribe-media --prepare-models
 ```
 
-English is the primary validated use case. Automatic language detection remains
-the default for general use; add `--language en` when every recording is known
-to be English. Other languages can be transcribed in place or translated to
-English with `--task translate`.
+English is the primary validated use case and the default. This avoids false
+language detection when a recording begins with silence, noise, music, or only
+fragmentary speech. To transcribe an unknown language in place, request
+automatic detection explicitly. Translation detects its source language by
+default.
 
 Common operations:
 
 ```bash
 ./transcribe-media --recursive
-./transcribe-media --language en
+./transcribe-media --language auto
 ./transcribe-media --task translate
 ./transcribe-media --overwrite
 ./transcribe-media --dry-run
@@ -222,10 +223,15 @@ match. Outputs and the manifest are written atomically; failures and
 interruptions are retried later. One bad media file does not stop the remaining
 batch.
 
-On GPUs below 16 GiB, including a 10 GiB RTX 3080, large-v3 transcription and
-alignment stay CUDA-accelerated while speaker/tone analysis runs on CPU to avoid
-VRAM contention. This does not substitute smaller models. CUDA out-of-memory
-errors are retried with smaller ASR batches.
+On GPUs below 16 GiB, including a 10 GiB RTX 3080, large-v3 transcription stays
+CUDA-accelerated while voice-activity detection, speaker, and tone analysis run
+on CPU to avoid VRAM contention. Alignment prefers CUDA and automatically
+retries the same model on CPU if the remaining VRAM is insufficient. This does
+not substitute smaller models. The CUDA ASR model is loaded before the CPU
+analysis stack. If float16 model initialization still exhausts available VRAM,
+the same large-v3 model is retried on CUDA with reduced-memory `int8_float16`;
+CPU ASR is the final fallback only in automatic-device mode. CUDA out-of-memory
+errors during transcription are retried with smaller ASR batches.
 
 ## Privacy and limitations
 

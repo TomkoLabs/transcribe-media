@@ -59,6 +59,7 @@ class RuntimeSettings:
     description: str
     analysis_device: str = "cpu"
     diarization_batch_size: int = 4
+    compute_type_was_auto: bool = True
 
 
 @dataclass(frozen=True)

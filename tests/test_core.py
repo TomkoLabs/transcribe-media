@@ -1466,6 +1466,18 @@ class SortformerTests(unittest.TestCase):
         )
         self.assertEqual(diarizer.last_run["detected_speakers"], 2)
 
+    def test_sortformer_restores_directly_to_requested_device(self):
+        model = self.FakeModel()
+        with mock.patch.object(
+            SortformerDiarizer,
+            "_load_pretrained_model",
+            return_value=model,
+        ) as load:
+            diarizer = SortformerDiarizer("cpu")
+        load.assert_called_once_with("cpu")
+        self.assertEqual(diarizer.device, "cpu")
+        self.assertEqual(model.device, "cpu")
+
     def test_ensemble_maps_sortformer_labels_and_annotates_words(self):
         class Primary:
             model_name = "test-primary"
@@ -1524,6 +1536,24 @@ class SortformerTests(unittest.TestCase):
 
 
 class ConfigurationTests(unittest.TestCase):
+    def test_english_is_the_default_transcription_language(self):
+        parser = cli.build_parser()
+        args = parser.parse_args([])
+        cli._validate_args(parser, args)
+        self.assertEqual(args.language, "en")
+
+    def test_explicit_auto_language_enables_detection(self):
+        parser = cli.build_parser()
+        args = parser.parse_args(["--language", "AUTO"])
+        cli._validate_args(parser, args)
+        self.assertIsNone(args.language)
+
+    def test_translation_detects_the_source_language_by_default(self):
+        parser = cli.build_parser()
+        args = parser.parse_args(["--task", "translate"])
+        cli._validate_args(parser, args)
+        self.assertIsNone(args.language)
+
     def test_exact_speaker_count_sets_both_diarization_bounds(self):
         parser = cli.build_parser()
         args = parser.parse_args(["--speakers", "3"])
@@ -1603,10 +1633,163 @@ class ConfigurationTests(unittest.TestCase):
         backend.task = "transcribe"
         backend.hf_token = None
         runtime = RuntimeSettings("cuda", "float16", 8, 4, True, "test")
-        backend._load_model(runtime)
+        events = []
+        asr_model = object()
+        cpu_vad = object()
+        with (
+            mock.patch.object(
+                backend,
+                "_load_ctranslate_model",
+                side_effect=lambda _runtime: (events.append("asr"), asr_model)[1],
+            ),
+            mock.patch.object(
+                backend,
+                "_load_cpu_vad",
+                side_effect=lambda: (events.append("vad"), cpu_vad)[1],
+            ),
+        ):
+            backend._load_model(runtime)
+        self.assertEqual(events, ["asr", "vad"])
         self.assertEqual(
             backend.whisperx.load_model.call_args.kwargs["device_index"], 0
         )
+        self.assertIs(
+            backend.whisperx.load_model.call_args.kwargs["model"], asr_model
+        )
+        self.assertIs(
+            backend.whisperx.load_model.call_args.kwargs["vad_model"], cpu_vad
+        )
+        self.assertEqual(backend.vad_device, "cpu")
+
+    def test_asr_preload_uses_whisperx_batched_model_subclass(self):
+        backend = WhisperXBackend.__new__(WhisperXBackend)
+        backend.model_name = "large-v3"
+        backend.hf_token = None
+        model = object()
+        model_class = mock.Mock(return_value=model)
+        fake_asr_module = mock.Mock(WhisperModel=model_class)
+        runtime = RuntimeSettings("cuda", "int8_float16", 8, 4, False, "test")
+        with mock.patch.dict("sys.modules", {"whisperx.asr": fake_asr_module}):
+            loaded = backend._load_ctranslate_model(runtime)
+        self.assertIs(loaded, model)
+        self.assertEqual(model_class.call_args.kwargs["device"], "cuda")
+        self.assertEqual(
+            model_class.call_args.kwargs["compute_type"], "int8_float16"
+        )
+
+    def test_cuda_alignment_oom_retries_same_alignment_model_on_cpu(self):
+        backend = WhisperXBackend.__new__(WhisperXBackend)
+        backend.runtime = RuntimeSettings("cuda", "int8_float16", 8, 4, False, "test")
+        backend.model_name = "large-v3"
+        backend.language = "en"
+        backend.task = "transcribe"
+        backend.vad_device = "cpu"
+        backend.model = mock.Mock()
+        backend.model.transcribe.return_value = {
+            "language": "en",
+            "segments": [{"start": 0.0, "end": 1.0, "text": "hello"}],
+        }
+        backend._decode_audio = mock.Mock(return_value=[])
+        backend._align_language = None
+        backend._align_device = None
+        backend._align_model = None
+        backend._align_metadata = None
+        backend.whisperx = mock.Mock()
+        backend.whisperx.load_align_model.side_effect = [
+            RuntimeError("CUDA out of memory"),
+            ("cpu-align-model", {"language": "en"}),
+        ]
+        backend.whisperx.align.return_value = {
+            "segments": [{"start": 0.0, "end": 1.0, "text": "hello"}]
+        }
+        with mock.patch(
+            "transcribe_media_app.backends.release_accelerator_memory"
+        ):
+            _result, _audio, provenance, degraded = backend.transcribe(
+                Path("clip.mp4"), align=True, verbose=False
+            )
+        devices = [
+            call.kwargs["device"]
+            for call in backend.whisperx.load_align_model.call_args_list
+        ]
+        self.assertEqual(devices, ["cuda", "cpu"])
+        self.assertEqual(provenance["alignment_device"], "cpu")
+        self.assertEqual(degraded, [])
+
+    def test_large_gpu_keeps_whisperx_vad_on_cuda(self):
+        backend = WhisperXBackend.__new__(WhisperXBackend)
+        backend.whisperx = mock.Mock()
+        backend.model_name = "large-v3"
+        backend.language = "en"
+        backend.task = "transcribe"
+        backend.hf_token = None
+        runtime = RuntimeSettings(
+            "cuda",
+            "float16",
+            8,
+            4,
+            True,
+            "test",
+            analysis_device="cuda",
+        )
+        with mock.patch.object(backend, "_load_cpu_vad") as load_cpu_vad:
+            backend._load_model(runtime)
+        load_cpu_vad.assert_not_called()
+        self.assertNotIn(
+            "vad_model", backend.whisperx.load_model.call_args.kwargs
+        )
+        self.assertEqual(backend.vad_device, "cuda")
+
+    def test_cuda_oom_retries_same_model_with_reduced_vram_compute(self):
+        runtime = RuntimeSettings(
+            "cuda",
+            "float16",
+            8,
+            4,
+            False,
+            "CUDA / float16, batch 8; VAD/speaker/tone CPU",
+            compute_type_was_auto=True,
+        )
+        with (
+            mock.patch.object(
+                WhisperXBackend,
+                "__init__",
+                side_effect=[RuntimeError("CUDA out of memory"), None],
+            ) as initialize,
+            mock.patch(
+                "transcribe_media_app.backends.release_accelerator_memory"
+            ),
+        ):
+            _backend, actual = WhisperXBackend.create(
+                "large-v3", "en", "transcribe", runtime, None
+            )
+        self.assertEqual(initialize.call_count, 2)
+        self.assertEqual(actual.device, "cuda")
+        self.assertEqual(actual.compute_type, "int8_float16")
+        self.assertIn("reduced-VRAM CUDA retry", actual.description)
+
+    def test_explicit_compute_type_does_not_silently_change_on_oom(self):
+        runtime = RuntimeSettings(
+            "cuda",
+            "float16",
+            8,
+            4,
+            False,
+            "test",
+            compute_type_was_auto=False,
+        )
+        with (
+            mock.patch.object(
+                WhisperXBackend,
+                "__init__",
+                side_effect=RuntimeError("CUDA out of memory"),
+            ) as initialize,
+            self.assertRaisesRegex(RuntimeError, "out of memory"),
+        ):
+            WhisperXBackend.create(
+                "large-v3", "en", "transcribe", runtime, None
+            )
+        self.assertEqual(initialize.call_count, 1)
 
     def test_known_ctranslate2_cuda_failure_has_repair_instructions(self):
         backend = WhisperXBackend.__new__(WhisperXBackend)
@@ -1645,6 +1828,7 @@ class ConfigurationTests(unittest.TestCase):
         self.assertEqual(runtime.device, "cuda")
         self.assertEqual(runtime.analysis_device, "cpu")
         self.assertEqual(runtime.diarization_batch_size, 4)
+        self.assertIn("VAD/speaker/tone CPU", runtime.description)
         self.assertIn("10.0 GiB GPU safeguard", runtime.description)
 
     def test_speaker_validation_rejects_silent_diarization_failure(self):
@@ -1872,6 +2056,37 @@ class FlowTests(unittest.TestCase):
             condensed = (root / "Transcribed" / "clip.mp4.txt").read_text()
             self.assertIn("ANALYSIS-READY TRANSCRIPT", condensed)
             self.assertNotIn("00:00:", condensed)
+
+    def test_runtime_fallback_does_not_force_every_file_to_reprocess(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "Video Source").mkdir()
+            (root / "Video Source" / "clip.mp4").write_bytes(b"media")
+            requested = RuntimeSettings(
+                "cuda", "float16", 8, 1, True, "requested"
+            )
+            adjusted = RuntimeSettings(
+                "cuda", "int8_float16", 8, 1, True, "adjusted"
+            )
+            with (
+                mock.patch.object(cli, "resolve_runtime", return_value=requested),
+                mock.patch.object(
+                    cli.WhisperXBackend,
+                    "create",
+                    return_value=(FakeBackend(), adjusted),
+                ),
+                mock.patch.object(cli, "ffprobe_duration", return_value=1.0),
+            ):
+                self.assertEqual(cli.main(self._args(root)), 0)
+            with (
+                mock.patch.object(cli, "resolve_runtime", return_value=requested),
+                mock.patch.object(
+                    cli.WhisperXBackend,
+                    "create",
+                    side_effect=AssertionError("fallback result was reprocessed"),
+                ),
+            ):
+                self.assertEqual(cli.main(self._args(root)), 0)
 
     def test_corrupt_file_fails_but_next_file_completes(self):
         with tempfile.TemporaryDirectory() as directory:

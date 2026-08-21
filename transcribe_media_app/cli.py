@@ -227,7 +227,11 @@ def build_parser() -> argparse.ArgumentParser:
 
     parser.add_argument("--model", default="large-v3", help="Whisper model name")
     parser.add_argument(
-        "--language", help="spoken language code; default is automatic detection"
+        "--language",
+        help=(
+            "spoken language code (default: en for transcription); use 'auto' "
+            "for detection"
+        ),
     )
     parser.add_argument(
         "--task",
@@ -393,6 +397,19 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def _validate_args(parser: argparse.ArgumentParser, args: argparse.Namespace) -> None:
+    if args.language is None:
+        # English is the product's primary, validated use case. Forcing it avoids
+        # unreliable first-30-second detection on recordings that begin with
+        # silence, music, noise, or fragmentary speech. Translation keeps
+        # detection as its natural default because its source language is
+        # normally unknown.
+        args.language = None if args.task == "translate" else "en"
+    else:
+        args.language = args.language.strip().lower()
+        if not args.language:
+            parser.error("--language cannot be empty")
+        if args.language == "auto":
+            args.language = None
     for option in (
         "min_speakers",
         "max_speakers",
@@ -543,7 +560,7 @@ def resolve_runtime(args: argparse.Namespace) -> RuntimeSettings:
             except Exception:
                 analysis_device = "cpu"
     diarization_batch_size = args.diarization_batch_size or 4
-    analysis_detail = f"speaker/tone {analysis_device.upper()}"
+    analysis_detail = f"VAD/speaker/tone {analysis_device.upper()}"
     if gpu_memory_gib is not None and analysis_device == "cpu":
         analysis_detail += f" ({gpu_memory_gib:.1f} GiB GPU safeguard)"
     return RuntimeSettings(
@@ -558,6 +575,7 @@ def resolve_runtime(args: argparse.Namespace) -> RuntimeSettings:
         ),
         analysis_device=analysis_device,
         diarization_batch_size=diarization_batch_size,
+        compute_type_was_auto=args.compute_type is None,
     )
 
 
@@ -1476,6 +1494,10 @@ def run_batch(args: argparse.Namespace) -> int:
     print(f"Primary transcripts: {paths.transcript_dir}")
     print(f"Review artifacts: {paths.review_dir}")
     print(f"Discovered {len(files)} media file(s).")
+    print(
+        "Speech language: "
+        + (args.language if args.language is not None else "automatic detection")
+    )
     if not files:
         return 0
 
@@ -1660,10 +1682,10 @@ def run_batch(args: argparse.Namespace) -> int:
         )
         return 1
     if actual_runtime != runtime:
+        same_device = actual_runtime.device == runtime.device
         runtime = actual_runtime
-        identity = settings_identity(settings, runtime)
-        settings_hash = stable_hash(identity)
-        print(f"Runtime fallback: {runtime.description}")
+        label = "Runtime adjustment" if same_device else "Runtime fallback"
+        print(f"{label}: {runtime.description}")
 
     try:
         diarizer = create_diarizer(

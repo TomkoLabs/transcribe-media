@@ -9,6 +9,7 @@ import re
 import subprocess
 import tempfile
 from contextlib import redirect_stderr, redirect_stdout
+from dataclasses import replace
 from importlib import metadata as importlib_metadata
 from pathlib import Path
 from typing import Any, Optional, Protocol
@@ -118,20 +119,56 @@ class WhisperXBackend:
         self.hf_token = hf_token
         self.model = self._load_model(runtime)
         self._align_language: Optional[str] = None
+        self._align_device: Optional[str] = None
         self._align_model: Any = None
         self._align_metadata: Optional[dict[str, Any]] = None
         self._active_audio: Optional[tuple[Any, Path]] = None
 
     def _load_model(self, runtime: RuntimeSettings) -> Any:
-        return self.whisperx.load_model(
+        options: dict[str, Any] = {
+            "device_index": 0,
+            "compute_type": runtime.compute_type,
+            "language": self.language,
+            "task": self.task,
+            "threads": runtime.threads,
+            "use_auth_token": self.hf_token,
+        }
+        self.vad_device = runtime.device
+        if runtime.device == "cuda" and runtime.analysis_device == "cpu":
+            # Construct CTranslate2 first. Initializing the PyTorch/pyannote
+            # stack before CTranslate2 can consume enough CUDA context headroom
+            # to make large-v3 fail on a 10 GiB display GPU even when the VAD
+            # weights themselves are placed on CPU.
+            options["model"] = self._load_ctranslate_model(runtime)
+            options["vad_model"] = self._load_cpu_vad()
+            self.vad_device = "cpu"
+        return self.whisperx.load_model(self.model_name, runtime.device, **options)
+
+    def _load_ctranslate_model(self, runtime: RuntimeSettings) -> Any:
+        # WhisperX extends faster-whisper with the batched generation method
+        # required by FasterWhisperPipeline. The upstream base class loads but
+        # then fails at inference because it lacks generate_segment_batched.
+        from whisperx.asr import WhisperModel
+
+        return WhisperModel(
             self.model_name,
-            runtime.device,
+            device=runtime.device,
             device_index=0,
             compute_type=runtime.compute_type,
-            language=self.language,
-            task=self.task,
-            threads=runtime.threads,
+            cpu_threads=runtime.threads,
             use_auth_token=self.hf_token,
+        )
+
+    @staticmethod
+    def _load_cpu_vad() -> Any:
+        import torch
+        from whisperx.vads.pyannote import Pyannote
+
+        return Pyannote(
+            torch.device("cpu"),
+            token=None,
+            vad_onset=0.500,
+            vad_offset=0.363,
         )
 
     @classmethod
@@ -143,35 +180,107 @@ class WhisperXBackend:
         runtime: RuntimeSettings,
         hf_token: Optional[str],
     ) -> tuple["WhisperXBackend", RuntimeSettings]:
+        initial_detail = ""
+        initial_was_oom = False
         try:
             return cls(model_name, language, task, runtime, hf_token), runtime
-        except Exception:
-            if runtime.device != "cuda" or not runtime.device_was_auto:
+        except Exception as exc:
+            if runtime.device != "cuda":
                 raise
-            fallback = RuntimeSettings(
-                device="cpu",
-                compute_type="int8",
-                batch_size=1,
-                threads=runtime.threads,
-                device_was_auto=True,
-                description="CUDA initialization failed; using CPU / int8",
-            )
-            return cls(model_name, language, task, fallback, hf_token), fallback
+            initial_detail = " ".join(str(exc).split()) or type(exc).__name__
+            initial_was_oom = "out of memory" in initial_detail.lower()
+            if (
+                not initial_was_oom or not runtime.compute_type_was_auto
+            ) and not runtime.device_was_auto:
+                raise
 
-    def _alignment_model(self, language: str) -> tuple[Any, dict[str, Any]]:
-        if self._align_language != language:
+        # The exception and its traceback are out of scope before cleanup. This
+        # matters because a partially constructed CTranslate2 model may retain
+        # device allocations while its traceback is still referenced.
+        release_accelerator_memory("cuda")
+
+        if (
+            initial_was_oom
+            and runtime.compute_type_was_auto
+            and runtime.compute_type != "int8_float16"
+        ):
+            reduced_runtime = replace(
+                runtime,
+                compute_type="int8_float16",
+                description=(
+                    runtime.description.replace(
+                        f"{runtime.device.upper()} / {runtime.compute_type}",
+                        f"{runtime.device.upper()} / int8_float16",
+                        1,
+                    )
+                    + "; reduced-VRAM CUDA retry"
+                ),
+            )
+            LOG.warning(
+                "CUDA float16 ASR initialization exhausted VRAM (%s); retrying "
+                "large-v3 on CUDA with int8_float16",
+                initial_detail[:1000],
+            )
+            reduced_detail = ""
+            try:
+                return (
+                    cls(model_name, language, task, reduced_runtime, hf_token),
+                    reduced_runtime,
+                )
+            except Exception as exc:
+                reduced_detail = " ".join(str(exc).split()) or type(exc).__name__
+                if not runtime.device_was_auto:
+                    raise RuntimeError(
+                        "CUDA ASR initialization failed with both float16 "
+                        f"({initial_detail}) and int8_float16 ({reduced_detail})"
+                    ) from exc
+            release_accelerator_memory("cuda")
+            fallback_detail = (
+                f"float16: {initial_detail}; int8_float16: {reduced_detail}"
+            )
+        else:
+            fallback_detail = initial_detail
+
+        if not runtime.device_was_auto:
+            raise RuntimeError(f"CUDA ASR initialization failed: {fallback_detail}")
+
+        LOG.warning(
+            "CUDA ASR initialization failed (%s); falling back to CPU / int8",
+            fallback_detail[:1000],
+        )
+        release_accelerator_memory("cuda")
+        fallback = RuntimeSettings(
+            device="cpu",
+            compute_type="int8",
+            batch_size=1,
+            threads=runtime.threads,
+            device_was_auto=True,
+            description="CUDA initialization failed; using CPU / int8",
+            compute_type_was_auto=runtime.compute_type_was_auto,
+        )
+        return cls(model_name, language, task, fallback, hf_token), fallback
+
+    def _alignment_model(
+        self, language: str, device: Optional[str] = None
+    ) -> tuple[Any, dict[str, Any]]:
+        target_device = device or self.runtime.device
+        if (
+            self._align_language != language
+            or self._align_device != target_device
+        ):
             self._align_model = None
             self._align_metadata = None
             gc.collect()
-            if self.runtime.device == "cuda":
+            if self._align_device == "cuda" or target_device == "cuda":
                 import torch
 
                 torch.cuda.empty_cache()
             model, metadata = self.whisperx.load_align_model(
                 language_code=language,
-                device=self.runtime.device,
+                device=target_device,
             )
             self._align_language = language
+            self._align_device = target_device
             self._align_model = model
             self._align_metadata = metadata
         assert self._align_metadata is not None
@@ -236,20 +345,53 @@ class WhisperXBackend:
         language = result.get("language") or self.language
         degraded: list[str] = []
         alignment_model_name = None
+        alignment_device = None
         if align and self.task != "translate":
             try:
                 if not language:
                     raise RuntimeError("speech recognizer did not return a language")
-                align_model, align_metadata = self._alignment_model(language)
-                aligned = self.whisperx.align(
-                    result.get("segments") or [],
-                    align_model,
-                    align_metadata,
-                    audio,
-                    self.runtime.device,
-                    return_char_alignments=False,
-                    print_progress=verbose,
-                )
+                alignment_device = self.runtime.device
+                try:
+                    align_model, align_metadata = self._alignment_model(
+                        language, alignment_device
+                    )
+                    aligned = self.whisperx.align(
+                        result.get("segments") or [],
+                        align_model,
+                        align_metadata,
+                        audio,
+                        alignment_device,
+                        return_char_alignments=False,
+                        print_progress=verbose,
+                    )
+                except Exception as exc:
+                    if (
+                        alignment_device != "cuda"
+                        or "out of memory" not in str(exc).lower()
+                    ):
+                        raise
+                    LOG.warning(
+                        "CUDA alignment exhausted VRAM; retrying the same "
+                        "alignment model on CPU"
+                    )
+                    self._align_model = None
+                    self._align_metadata = None
+                    self._align_language = None
+                    self._align_device = None
+                    release_accelerator_memory("cuda")
+                    alignment_device = "cpu"
+                    align_model, align_metadata = self._alignment_model(
+                        language, alignment_device
+                    )
+                    aligned = self.whisperx.align(
+                        result.get("segments") or [],
+                        align_model,
+                        align_metadata,
+                        audio,
+                        alignment_device,
+                        return_char_alignments=False,
+                        print_progress=verbose,
+                    )
                 aligned["language"] = language
                 result = aligned
                 alignment_model_name = f"whisperx-default:{language}"
@@ -265,8 +407,10 @@ class WhisperXBackend:
             "ctranslate2_version": package_version("ctranslate2"),
             "transcription_model": self.model_name,
             "alignment_model": alignment_model_name,
+            "alignment_device": alignment_device,
             "language_detected": language,
             "batch_size_used": used_batch_size,
+            "vad_device": self.vad_device,
         }
         return result, audio, provenance, degraded
 
@@ -593,13 +737,24 @@ class SortformerDiarizer:
     name = "nvidia/sortformer-v2.1"
     model_name = SORTFORMER_MODEL
 
+    @classmethod
+    def _load_pretrained_model(cls, device: str) -> Any:
+        import torch
+        from nemo.collections.asr.models import SortformerEncLabelModel
+
+        return SortformerEncLabelModel.from_pretrained(
+            cls.model_name,
+            map_location=torch.device(device),
+        )
+
     def __init__(self, device: str, model: Any = None) -> None:
         import torch
 
         if model is None:
-            from nemo.collections.asr.models import SortformerEncLabelModel
-
-            model = SortformerEncLabelModel.from_pretrained(self.model_name)
+            # Apply the target during restore. Calling .to(cpu) afterward is too
+            # late: NeMo may first restore a CUDA checkpoint and exhaust the GPU
+            # already occupied by ASR.
+            model = self._load_pretrained_model(device)
         self.device = device
         self.model = model.to(torch.device(device)) if hasattr(model, "to") else model
         if hasattr(self.model, "eval"):
