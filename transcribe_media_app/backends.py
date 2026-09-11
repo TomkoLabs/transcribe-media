@@ -24,7 +24,7 @@ from .speakers import (
 
 LOG = logging.getLogger(__name__)
 SUPPORTED_CTRANSLATE2_VERSION = "4.7.2"
-SPEAKER_REFINEMENT_VERSION = "1.2"
+SPEAKER_REFINEMENT_VERSION = "1.3"
 SPEAKER_REFINEMENT_MAX_RUN_SECONDS = 2.0
 SPEAKER_REFINEMENT_CONTEXT_GAP_SECONDS = 1.25
 SPEAKER_REFINEMENT_SENTENCE_SEAM_GAP_SECONDS = 0.12
@@ -306,12 +306,29 @@ class WhisperXBackend:
         used_batch_size = batch_sizes[0]
         for batch_size in batch_sizes:
             try:
-                result = self.model.transcribe(
-                    audio,
-                    batch_size=batch_size,
-                    chunk_size=30,
-                    print_progress=verbose,
-                )
+                if getattr(self, "quality", False):
+                    decoded, info = self.model.model.transcribe(
+                        audio, language=self.language, task=self.task,
+                        log_progress=verbose, beam_size=5, best_of=5,
+                        temperature=(0., 0.2, 0.4, 0.6, 0.8, 1.),
+                        compression_ratio_threshold=2.4, log_prob_threshold=-1.,
+                        no_speech_threshold=0.6, condition_on_previous_text=False,
+                        vad_filter=True, vad_parameters={"threshold": 0.35,
+                            "min_speech_duration_ms": 100, "min_silence_duration_ms": 300,
+                            "speech_pad_ms": 400},
+                    )
+                    segments = [{"start": segment.start, "end": segment.end, "text": segment.text,
+                                 "avg_logprob": segment.avg_logprob, "no_speech_prob": segment.no_speech_prob,
+                                 "compression_ratio": segment.compression_ratio, "temperature": segment.temperature}
+                                for segment in decoded]
+                    result = {"segments": segments, "language": info.language}
+                else:
+                    result = self.model.transcribe(
+                        audio,
+                        batch_size=batch_size,
+                        chunk_size=30,
+                        print_progress=verbose,
+                    )
                 used_batch_size = batch_size
                 break
             except Exception as exc:
@@ -343,6 +360,7 @@ class WhisperXBackend:
             raise last_error
 
         language = result.get("language") or self.language
+        diagnostics = [dict(segment) for segment in result.get("segments", [])] if getattr(self, "quality", False) else []
         degraded: list[str] = []
         alignment_model_name = None
         alignment_device = None
@@ -411,7 +429,10 @@ class WhisperXBackend:
             "language_detected": language,
             "batch_size_used": used_batch_size,
             "vad_device": self.vad_device,
+            "decoding_mode": "sequential_temperature_fallback" if getattr(self, "quality", False) else "whisperx_batched",
         }
+        if diagnostics:
+            result["asr_diagnostics"] = diagnostics
         return result, audio, provenance, degraded
 
     def _decode_audio(self, source: Path) -> Any:
@@ -840,6 +861,21 @@ def _timeline_overlap(
     )
 
 
+def _overlap_join(queries, timeline):
+    """Sweep chronological intervals instead of rescanning a recording per word."""
+    intervals = sorted(timeline, key=lambda item: float(item["start"]))
+    cursor = 0
+    active = []
+    for query in sorted(queries, key=lambda item: float(item["start"])):
+        start, end = float(query["start"]), float(query["end"])
+        active = [item for item in active if float(item["end"]) > start]
+        while cursor < len(intervals) and float(intervals[cursor]["start"]) < end:
+            if float(intervals[cursor]["end"]) > start:
+                active.append(intervals[cursor])
+            cursor += 1
+        yield query, [item for item in active if float(item["start"]) < end]
+
+
 def _map_secondary_timeline(
     primary: list[dict[str, Any]], secondary: list[dict[str, Any]]
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
@@ -859,8 +895,10 @@ def _map_secondary_timeline(
     primary_indexes = {
         speaker: index for index, speaker in enumerate(primary_speakers)
     }
-    for secondary_item in secondary:
-        for primary_item in primary:
+    totals = {speaker: 0. for speaker in secondary_speakers}
+    for secondary_item, overlaps in _overlap_join(secondary, primary):
+        totals[str(secondary_item["speaker"])] += max(0., float(secondary_item["end"]) - float(secondary_item["start"]))
+        for primary_item in overlaps:
             matrix[
                 secondary_indexes[str(secondary_item["speaker"])],
                 primary_indexes[str(primary_item["speaker"])],
@@ -874,16 +912,18 @@ def _map_secondary_timeline(
             continue
         secondary_speaker = secondary_speakers[row]
         primary_speaker = primary_speakers[column]
-        total = sum(
-            max(0.0, float(item["end"]) - float(item["start"]))
-            for item in secondary
-            if str(item["speaker"]) == secondary_speaker
-        )
-        mapping[secondary_speaker] = primary_speaker
+        total = totals[secondary_speaker]
+        runner_up = max((float(matrix[row, other]) for other in range(len(primary_speakers)) if other != column), default=0.)
+        confident = overlap >= 0.5 and overlap / max(total, 1e-8) >= 0.6 and (overlap - runner_up) / max(total, 1e-8) >= 0.15
+        if confident:
+            mapping[secondary_speaker] = primary_speaker
         reports.append(
             {
                 "sortformer_speaker": secondary_speaker,
-                "primary_speaker": primary_speaker,
+                "primary_speaker": primary_speaker if confident else None,
+                "proposed_primary_speaker": primary_speaker,
+                "mapping_confident": confident,
+                "mapping_margin_fraction": round((overlap - runner_up) / max(total, 1e-8), 4),
                 "overlap_seconds": round(overlap, 3),
                 "overlap_fraction": round(overlap / max(total, 1e-8), 4),
             }
@@ -906,31 +946,55 @@ def _annotate_sortformer_words(
 ) -> tuple[int, int]:
     annotated = 0
     agreements = 0
-    for segment in result.get("segments") or []:
-        for word in segment.get("words") or []:
-            if word.get("start") is None or word.get("end") is None:
+    words = [word for segment in result.get("segments") or [] for word in segment.get("words") or []
+             if word.get("start") is not None and word.get("end") is not None]
+    for word, overlaps in _overlap_join(words, timeline):
+        candidates: dict[str, float] = {}
+        raw_labels: dict[str, float] = {}
+        for item in overlaps:
+            overlap = _timeline_overlap(word, item)
+            mapped = item.get("speaker")
+            if overlap <= 0.0 or not mapped:
                 continue
-            candidates: dict[str, float] = {}
-            raw_labels: dict[str, float] = {}
-            for item in timeline:
-                overlap = _timeline_overlap(
-                    {"start": word["start"], "end": word["end"]}, item
-                )
-                mapped = item.get("speaker")
-                if overlap <= 0.0 or not mapped:
-                    continue
-                candidates[str(mapped)] = candidates.get(str(mapped), 0.0) + overlap
-                raw = str(item.get("sortformer_speaker") or "")
-                raw_labels[raw] = raw_labels.get(raw, 0.0) + overlap
-            if not candidates:
-                continue
-            speaker = max(candidates, key=candidates.get)
-            word["sortformer_speaker"] = speaker
-            word["sortformer_model_speaker"] = max(raw_labels, key=raw_labels.get)
-            annotated += 1
-            if speaker == str(word.get("speaker")):
-                agreements += 1
+            candidates[str(mapped)] = candidates.get(str(mapped), 0.0) + overlap
+            raw = str(item.get("sortformer_speaker") or "")
+            raw_labels[raw] = raw_labels.get(raw, 0.0) + overlap
+        if not candidates:
+            if overlaps:
+                word["sortformer_ambiguous"] = True
+            continue
+        speaker = max(candidates, key=candidates.get)
+        duration = max(1e-8, float(word["end"]) - float(word["start"]))
+        second = max((value for key, value in candidates.items() if key != speaker), default=0.)
+        if candidates[speaker] / duration < 0.6 or (candidates[speaker] - second) / duration < 0.15:
+            word["sortformer_ambiguous"] = True
+            continue
+        word["sortformer_speaker"] = speaker
+        word["sortformer_model_speaker"] = max(raw_labels, key=raw_labels.get)
+        annotated += 1
+        if speaker == str(word.get("speaker")):
+            agreements += 1
     return annotated, agreements
+
+
+def _secondary_consensus(words: list[dict[str, Any]]) -> tuple[Optional[str], float]:
+    """Require coverage of the candidate itself before accepting a second vote."""
+    totals: dict[str, float] = {}
+    duration = 0.0
+    for word in words:
+        if word.get("start") is None or word.get("end") is None:
+            continue
+        seconds = max(0.0, float(word["end"]) - float(word["start"]))
+        duration += seconds
+        speaker = word.get("sortformer_speaker")
+        if speaker:
+            totals[str(speaker)] = totals.get(str(speaker), 0.0) + seconds
+    compared = sum(totals.values())
+    if not totals or compared < max(0.2, duration * 0.5):
+        return None, 0.0
+    best = max(totals, key=totals.get)
+    fraction = totals[best] / compared
+    return (best if fraction >= 0.65 else None), fraction
 
 
 class PyannoteSortformerEnsemble:
@@ -1643,8 +1707,9 @@ class SpeakerIdentityEncoder:
     name = SPEAKER_EMBEDDING_MODEL
     version = SPEAKER_EMBEDDING_REVISION
 
-    def __init__(self, device: str, classifier: Any = None) -> None:
+    def __init__(self, device: str, classifier: Any = None, quality: bool = False) -> None:
         self.device = device
+        self.quality = quality
         self.classifier = classifier or _load_speaker_encoder(device)
 
     def _encode_samples(self, samples: Any) -> Any:
@@ -1776,31 +1841,10 @@ class SpeakerIdentityEncoder:
                 )
                 margin = target_score - runner_up
 
-                secondary_durations: dict[str, float] = {}
-                for word in utterance["words"]:
-                    secondary = word.get("sortformer_speaker")
-                    if not secondary:
-                        continue
-                    word_duration = max(
-                        0.0, float(word["end"]) - float(word["start"])
-                    )
-                    secondary_durations[str(secondary)] = (
-                        secondary_durations.get(str(secondary), 0.0)
-                        + word_duration
-                    )
-                secondary_consensus = None
-                secondary_fraction = 0.0
-                if secondary_durations:
-                    secondary_total = sum(secondary_durations.values())
-                    secondary_consensus = max(
-                        secondary_durations, key=secondary_durations.get
-                    )
-                    secondary_fraction = (
-                        secondary_durations[secondary_consensus]
-                        / max(secondary_total, 1e-8)
-                    )
-                    if secondary_fraction < 0.65:
-                        secondary_consensus = None
+                # Neighboring speech must not outvote a genuine short reply.
+                secondary_consensus, secondary_fraction = _secondary_consensus(
+                    middle["words"]
+                )
 
                 required_similarity = SPEAKER_REFINEMENT_UTTERANCE_MIN_SIMILARITY
                 required_margin = SPEAKER_REFINEMENT_UTTERANCE_MIN_MARGIN
@@ -1840,6 +1884,39 @@ class SpeakerIdentityEncoder:
                     evaluated_candidates.append(audit)
                     continue
 
+                middle_embedding = self._encode_interval(
+                    audio, float(middle["start"]), float(middle["end"])
+                )
+                middle_scores = (
+                    {
+                        speaker: cosine_similarity(middle_embedding, item["embedding"])
+                        for speaker, item in prototypes.items()
+                    }
+                    if middle_embedding is not None
+                    else {}
+                )
+                middle_margin = (
+                    middle_scores[target] - max(
+                        score for speaker, score in middle_scores.items()
+                        if speaker != target
+                    )
+                    if middle_scores
+                    else -1.0
+                )
+                audit["candidate_similarity"] = round(middle_scores.get(target, -1.0), 4)
+                audit["candidate_margin"] = round(middle_margin, 4)
+                if (
+                    not middle_scores
+                    or middle_scores[target] < SPEAKER_REFINEMENT_MICRO_MIN_SIMILARITY
+                    or middle_margin < required_margin
+                ):
+                    audit["decision"] = "abstained_candidate_voice_ambiguous"
+                    evaluated_candidates.append(audit)
+                    protected_intervals.append(
+                        (float(middle["start"]), float(middle["end"]))
+                    )
+                    continue
+
                 audit["decision"] = "corrected"
                 evaluated_candidates.append(audit)
                 corrections.append(
@@ -1873,9 +1950,9 @@ class SpeakerIdentityEncoder:
                     }
                 )
 
-        accepted_intervals = [
+        accepted_intervals = sorted([
             (float(item["start"]), float(item["end"])) for item in corrections
-        ] + protected_intervals
+        ] + protected_intervals)
         for index, run in enumerate(runs):
             start = float(run["start"])
             end = float(run["end"])
@@ -1968,7 +2045,22 @@ class SpeakerIdentityEncoder:
                 )
                 evaluated_candidates.append(audit)
                 continue
-            margin = refined_score - original_score
+            runner_up = max(
+                score for speaker, score in scores.items() if speaker != refined
+            )
+            margin = refined_score - runner_up
+            secondary_consensus, secondary_fraction = _secondary_consensus(
+                run["words"]
+            )
+            audit.update({
+                "runner_up_similarity": round(runner_up, 4),
+                "sortformer_consensus": secondary_consensus,
+                "sortformer_consensus_fraction": round(secondary_fraction, 4),
+            })
+            if secondary_consensus not in (None, refined):
+                audit["decision"] = "abstained_sortformer_disagreement"
+                evaluated_candidates.append(audit)
+                continue
             context_support = sum(speaker == refined for speaker in neighbors)
             sentence_seam_support = sum(
                 speaker == refined for speaker in sentence_seam_speakers
@@ -2227,6 +2319,10 @@ class SpeakerIdentityEncoder:
         result: Optional[dict[str, Any]] = None,
     ) -> dict[str, dict[str, Any]]:
         import numpy as np
+
+        if getattr(self, "quality", False):
+            from .evidence import extract_reference_evidence
+            return extract_reference_evidence(audio, timeline, result or {}, self._encode_samples)
 
         speakers = sorted(
             {

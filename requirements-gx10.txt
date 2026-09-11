@@ -1,0 +1,4 @@
+# ARM64/GB10: PyTorch 2.8 cu129 supplies its own matched CUDA library pins.
+# Do not include requirements-gpu.txt's x86 CUDA 12.6 libraries here.
+# The installer rebuilds CTranslate2 4.7.2 with CUDA: its PyPI ARM wheel is CPU-only.
+nemo-toolkit[asr]==2.7.3

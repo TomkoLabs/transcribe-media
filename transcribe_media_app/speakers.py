@@ -148,6 +148,9 @@ class VoiceRegistry:
         match_margin: float = DEFAULT_MATCH_MARGIN,
         local_merge_threshold: float = DEFAULT_LOCAL_MERGE_THRESHOLD,
         enrollment_seconds: float = DEFAULT_ENROLLMENT_SECONDS,
+        known_voices: Iterable[str] = (),
+        learn: bool = True,
+        reviewed: bool = False,
     ) -> None:
         self.path = path
         self.lock_path = path.with_name(f".{path.name}.lock")
@@ -157,6 +160,9 @@ class VoiceRegistry:
         self.match_margin = match_margin
         self.local_merge_threshold = local_merge_threshold
         self.enrollment_seconds = enrollment_seconds
+        self.known_voices = tuple(sorted(set(known_voices)))
+        self.learn = learn
+        self.reviewed = reviewed
 
     def _empty(self) -> dict[str, Any]:
         return {
@@ -256,7 +262,7 @@ class VoiceRegistry:
                 )
             _normalize(centroid)
             observations = profile.get("observations")
-            if not isinstance(observations, list) or not observations:
+            if not isinstance(observations, list) or (not observations and profile.get("reference_status") != "needs_review"):
                 raise SpeakerRegistryError(
                     f"speaker profile {voice_id!r} has no observations"
                 )
@@ -279,6 +285,8 @@ class VoiceRegistry:
                     )
                 observation_ids.add(observation_id)
                 _normalize(embedding)
+            if not observations:
+                continue
             expected_centroid = _centroid(
                 observation["embedding"] for observation in observations
             )
@@ -296,7 +304,108 @@ class VoiceRegistry:
     def validate(self) -> dict[str, Any]:
         with self._locked():
             data = self._load_unlocked()
+            self._validate_matching_policy(data)
         return self._summary(data)
+
+    def profiles_for_review(self) -> list[dict[str, Any]]:
+        with self._locked():
+            data = self._load_unlocked()
+        return [{"voice_id": key, "label": item.get("label", key),
+                 "role": item.get("role", "unspecified"),
+                 "verified_windows": sum(bool(obs.get("verified")) for obs in item["observations"]),
+                 "verified_sessions": len({obs["source_fingerprint"] for obs in item["observations"] if obs.get("verified")})}
+                for key, item in sorted(data["profiles"].items())]
+
+    @staticmethod
+    def profile_similarity(profile, embedding, reviewed=False):
+        if not profile.get("observations"):
+            return -1.0
+        if not reviewed:
+            return cosine_similarity(embedding, profile["centroid"])
+        sessions: dict[str, list] = {}
+        for observation in profile["observations"]:
+            if observation.get("verified") and observation.get("clean_seconds", 0.) >= 2.5:
+                sessions.setdefault(observation["source_fingerprint"], []).append(observation["embedding"])
+        scores = []
+        for vectors in sessions.values():
+            if len(vectors) < 2:
+                continue
+            # Two supporting reviewed clips are required in a recording condition.
+            support = sorted((cosine_similarity(embedding, vector) for vector in vectors), reverse=True)
+            scores.append(min(cosine_similarity(embedding, _centroid(vectors)), support[1]))
+        return max(scores, default=-1.0)
+
+    def confirm_references(self, references, new_profiles=None, review_id=None, replace_source_fingerprint=None):
+        """Apply validated human decisions atomically; never reinterpret a score as probability."""
+        with self._locked():
+            data = self._load_unlocked()
+            if review_id and review_id in data.get("applied_reviews", {}):
+                return data["applied_reviews"][review_id]
+            if replace_source_fingerprint:
+                for profile in data["profiles"].values():
+                    profile["observations"] = [item for item in profile["observations"]
+                                               if not (item.get("verified") and item["source_fingerprint"] == replace_source_fingerprint)]
+            mapping = {}
+            for key, metadata in sorted((new_profiles or {}).items()):
+                voice_id = self._new_voice_id(data)
+                mapping[key] = voice_id
+                data["profiles"][voice_id] = {"voice_id": voice_id, "label": metadata["label"],
+                    "role": metadata.get("role", "unspecified"), "created_utc": utc_now(),
+                    "observations": [], "centroid": []}
+            for reference in references:
+                voice_id = mapping.get(reference["profile"], reference["profile"])
+                if voice_id not in data["profiles"]:
+                    raise SpeakerRegistryError(f"unknown reviewed profile {voice_id}")
+                observation = copy.deepcopy(reference["observation"])
+                observation["embedding"] = _normalize(observation["embedding"])
+                dimension = data["embedding_model"]["dimension"]
+                if dimension is not None and len(observation["embedding"]) != dimension:
+                    raise SpeakerRegistryError("reviewed reference uses a different embedding model")
+                data["embedding_model"]["dimension"] = len(observation["embedding"])
+                observation.update(verified=True, review_id=review_id, verified_utc=utc_now())
+                self._add_observation(data, voice_id, observation)
+            for voice_id in mapping.values():
+                if not data["profiles"][voice_id]["observations"]:
+                    raise SpeakerRegistryError("a new profile needs at least one clean reviewed reference window")
+            self._refresh_profiles(data)
+            if review_id:
+                data.setdefault("applied_reviews", {})[review_id] = mapping
+            data.setdefault("audit", []).append({"action": "human_review", "review_id": review_id,
+                "created_utc": utc_now(), "references": len(references), "new_profiles": mapping})
+            data["revision"] += 1
+            self._save_unlocked(data)
+            return mapping
+
+    def merge_profiles(self, source_id, target_id):
+        with self._locked():
+            data = self._load_unlocked()
+            if source_id == target_id or any(key not in data["profiles"] for key in (source_id, target_id)):
+                raise SpeakerRegistryError("merge requires two different existing VOICE IDs")
+            source = data["profiles"].pop(source_id)
+            data["profiles"][target_id]["observations"].extend(source["observations"])
+            aliases = data.setdefault("aliases", {})
+            for alias, destination in list(aliases.items()):
+                if destination == source_id:
+                    aliases[alias] = target_id
+            aliases[source_id] = target_id
+            data.setdefault("audit", []).append({"action": "merge", "source": source_id,
+                "target": target_id, "created_utc": utc_now()})
+            self._refresh_profiles(data)
+            data["revision"] += 1
+            self._save_unlocked(data)
+            return aliases
+
+    def _validate_matching_policy(self, data: dict[str, Any]) -> None:
+        missing = set(self.known_voices) - set(data["profiles"])
+        if missing:
+            raise SpeakerRegistryError(
+                "known VOICE IDs are absent from this registry: "
+                + ", ".join(sorted(missing))
+            )
+        if not self.learn and not data["profiles"]:
+            raise SpeakerRegistryError(
+                "--no-speaker-learning requires an existing, nonempty voice registry"
+            )
 
     def _save_unlocked(self, data: dict[str, Any]) -> None:
         data["program_version"] = __version__
@@ -464,8 +573,12 @@ class VoiceRegistry:
         if (
             existing_profile == voice_id
             and existing_observation is not None
+            and bool(existing_observation.get("verified")) == bool(observation.get("verified"))
             and self._same_observation(existing_observation, observation)
         ):
+            return False
+
+        if existing_observation and existing_observation.get("verified") and not observation.get("verified"):
             return False
 
         for profile in data["profiles"].values():
@@ -477,18 +590,22 @@ class VoiceRegistry:
         profile = data["profiles"][voice_id]
         observations = list(profile.get("observations") or [])
         observations.append(observation)
-        profile["observations"] = observations[-MAX_PROFILE_OBSERVATIONS:]
+        anchors = [item for item in observations if item.get("verified")]
+        automatic = [item for item in observations if not item.get("verified")]
+        profile["observations"] = anchors + automatic[-MAX_PROFILE_OBSERVATIONS:]
         profile["last_seen_utc"] = utc_now()
         return True
 
     @staticmethod
     def _refresh_profiles(data: dict[str, Any]) -> None:
-        empty = []
         for voice_id, profile in data["profiles"].items():
             observations = profile.get("observations") or []
             if not observations:
-                empty.append(voice_id)
+                profile["reference_status"] = "needs_review"
+                profile["sessions_seen"] = 0
+                profile["clean_seconds"] = 0.
                 continue
+            profile["reference_status"] = "available"
             profile["centroid"] = _centroid(item["embedding"] for item in observations)
             profile["sessions_seen"] = len(
                 {item.get("source_fingerprint") for item in observations}
@@ -500,8 +617,6 @@ class VoiceRegistry:
                 ),
                 3,
             )
-        for voice_id in empty:
-            del data["profiles"][voice_id]
 
     @staticmethod
     def _eligible_for_local_merge(evidence: dict[str, Any]) -> bool:
@@ -524,6 +639,10 @@ class VoiceRegistry:
         similarities: dict[frozenset[str], float] = {}
         candidates: list[tuple[float, str, str]] = []
         for index, first in enumerate(speakers):
+            if self.reviewed:
+                # In quality mode cluster merges are human decisions. A toddler's
+                # short cluster must not disappear into a nearby adult prototype.
+                break
             first_evidence = usable.get(first)
             if first_evidence is None or not self._eligible_for_local_merge(
                 first_evidence
@@ -590,6 +709,8 @@ class VoiceRegistry:
                     cohesion_values.append(pair_similarity)
         return {
             "embedding": embedding,
+            "windows": [window for item in items for window in item.get("windows", [])],
+            "suspected_mixed_speakers": any(item.get("suspected_mixed_speakers") for item in items),
             "clean_seconds": sum(_number(item.get("clean_seconds")) for item in items),
             "available_clean_seconds": sum(
                 _number(item.get("available_clean_seconds")) for item in items
@@ -630,8 +751,9 @@ class VoiceRegistry:
         with self._locked():
             existed = self.path.exists()
             data = self._load_unlocked()
+            self._validate_matching_policy(data)
             profiles = data["profiles"]
-            profile_ids = sorted(profiles)
+            profile_ids = list(self.known_voices) or sorted(profiles)
             initial_profile_count = len(profile_ids)
             dimension = data["embedding_model"].get("dimension")
 
@@ -662,9 +784,7 @@ class VoiceRegistry:
                     (
                         (
                             voice_id,
-                            cosine_similarity(
-                                item["embedding"], profiles[voice_id]["centroid"]
-                            ),
+                            self.profile_similarity(profiles[voice_id], item["embedding"], self.reviewed),
                         )
                         for voice_id in profile_ids
                     ),
@@ -679,7 +799,24 @@ class VoiceRegistry:
                 voice_id, score = candidates[0]
                 runner_up = candidates[1][1] if len(candidates) > 1 else -1.0
                 margin = score - runner_up
-                if score >= self.match_threshold and margin >= self.match_margin:
+                threshold = max(self.match_threshold, 0.70 if self.reviewed else -1.)
+                required_margin = max(self.match_margin, 0.15 if self.reviewed else 0.)
+                reliable = True
+                if self.reviewed:
+                    item = grouped_evidence[group]
+                    windows = [window for window in item.get("windows", []) if window.get("retained", True)]
+                    votes = 0
+                    for window in windows:
+                        window_scores = sorted((self.profile_similarity(profiles[key], window["embedding"], True), key)
+                                               for key in profile_ids)
+                        best_window, winner = window_scores[-1]
+                        second_window = window_scores[-2][0] if len(window_scores) > 1 else -1.
+                        votes += winner == voice_id and best_window >= threshold and best_window - second_window >= required_margin
+                    reliable = bool(len(windows) >= 2 and votes / len(windows) >= 0.8
+                                    and not item.get("suspected_mixed_speakers"))
+                    if profiles[voice_id].get("role") == "child":
+                        threshold = max(threshold, 0.78)
+                if reliable and score >= threshold and margin >= required_margin:
                     proposals.append((score, group, voice_id, margin))
 
             group_assignments: dict[tuple[str, ...], dict[str, Any]] = {}
@@ -695,7 +832,7 @@ class VoiceRegistry:
                 }
                 used_profiles.add(voice_id)
 
-            dirty = not existed
+            dirty = not existed and self.learn
             new_voice_ceiling = self.match_threshold - self.match_margin / 2.0
             for group in groups:
                 item = grouped_evidence[group]
@@ -710,7 +847,12 @@ class VoiceRegistry:
                 sufficiently_novel = (
                     best_score is None or best_score <= new_voice_ceiling
                 )
-                if can_enroll and (registry_was_empty or sufficiently_novel):
+                enrollment_allowed = self.learn and not self.known_voices and not self.reviewed
+                if (
+                    enrollment_allowed
+                    and can_enroll
+                    and (registry_was_empty or sufficiently_novel)
+                ):
                     voice_id = self._new_voice_id(data)
                     data["profiles"][voice_id] = {
                         "voice_id": voice_id,
@@ -736,7 +878,11 @@ class VoiceRegistry:
                         "status": (
                             "unresolved_insufficient_audio"
                             if item is None or not can_enroll
-                            else "unresolved_ambiguous"
+                            else (
+                                "unresolved_no_confident_known_match"
+                                if not enrollment_allowed
+                                else "unresolved_ambiguous"
+                            )
                         ),
                         "similarity": (
                             round(best_score, 4) if best_score is not None else None
@@ -745,6 +891,8 @@ class VoiceRegistry:
                     }
 
             for group, decision in group_assignments.items():
+                if not self.learn:
+                    continue
                 if decision["status"] not in {"matched", "enrolled"}:
                     continue
                 item = grouped_evidence[group]
@@ -753,6 +901,10 @@ class VoiceRegistry:
                 if decision["status"] == "matched" and not self._eligible_for_update(
                     item
                 ):
+                    continue
+                if self.reviewed and (decision.get("similarity", 0.) < 0.85
+                                      or decision.get("margin", 0.) < 0.20
+                                      or item.get("clean_seconds", 0.) < 12):
                     continue
                 observation = self._observation(
                     source_key,
@@ -779,6 +931,16 @@ class VoiceRegistry:
                 if frozenset((first, second)) in local_similarities
             ]
             decision = group_assignments[group]
+            candidates = scored.get(group) or []
+            # Retain alternatives for review without exposing biometric vectors.
+            if self.reviewed and grouped_evidence[group]:
+                candidates = sorted(((key, cosine_similarity(grouped_evidence[group]["embedding"], profiles[key]["centroid"]))
+                                     for key in profile_ids), key=lambda pair: pair[1], reverse=True)
+            candidate_report = [
+                {"speaker": voice_id, "similarity": round(score, 4),
+                 "score_kind": "centroid_cosine", "probability": None}
+                for voice_id, score in candidates[:3]
+            ]
             group_report = {
                 "local_speakers": list(group),
                 "speaker": decision["speaker"],
@@ -794,6 +956,7 @@ class VoiceRegistry:
                     "local_cluster_merged": len(group) > 1,
                     "reconciled_local_speakers": list(group),
                     "local_cluster_similarity": group_report["minimum_similarity"],
+                    "candidates": candidate_report,
                 }
 
         matches = []
@@ -837,6 +1000,12 @@ class VoiceRegistry:
             "match_margin": self.match_margin,
             "local_merge_threshold": self.local_merge_threshold,
             "enrollment_seconds": self.enrollment_seconds,
+            "known_voices": list(self.known_voices),
+            "learning_enabled": self.learn,
+            "enrollment_enabled": self.learn and not self.known_voices and not self.reviewed,
+            "reviewed_matching": self.reviewed,
+            "score_kind": "verified_condition_consensus" if self.reviewed else "cosine_similarity",
+            "scores_are_probabilities": False,
             "minimum_speaker_groups": minimum_groups,
             "active_speaker_count": len(active_speaker_ids),
             "active_speaker_ids": active_speaker_ids,

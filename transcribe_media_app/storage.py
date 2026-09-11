@@ -1,9 +1,13 @@
 from __future__ import annotations
 
 import hashlib
+import base64
+import fcntl
 import json
 import os
 import subprocess
+import tempfile
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable, Optional
@@ -24,13 +28,20 @@ def utc_now() -> str:
 
 def atomic_write_text(path: Path, content: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    descriptor, name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
+    temporary = Path(name)
     try:
-        with temporary.open("w", encoding="utf-8", newline="\n") as handle:
+        os.fchmod(descriptor, 0o600)
+        with os.fdopen(descriptor, "w", encoding="utf-8", newline="\n") as handle:
             handle.write(content)
             handle.flush()
             os.fsync(handle.fileno())
         temporary.replace(path)
+        directory = os.open(path.parent, os.O_RDONLY)
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
     finally:
         temporary.unlink(missing_ok=True)
 
@@ -50,21 +61,81 @@ def stable_hash(payload: Any) -> str:
 
 
 def source_fingerprint(path: Path) -> dict[str, Any]:
-    """Return a durable, bounded-cost fingerprint without loading the file."""
+    """Hash the complete recording with bounded memory, including middle edits."""
     stat = path.stat()
     digest = hashlib.sha256()
-    digest.update(str(stat.st_size).encode("ascii"))
     with path.open("rb") as handle:
-        first = handle.read(FINGERPRINT_CHUNK_BYTES)
-        digest.update(first)
-        if stat.st_size > FINGERPRINT_CHUNK_BYTES:
-            handle.seek(max(0, stat.st_size - FINGERPRINT_CHUNK_BYTES))
-            digest.update(handle.read(FINGERPRINT_CHUNK_BYTES))
+        for chunk in iter(lambda: handle.read(FINGERPRINT_CHUNK_BYTES), b""):
+            digest.update(chunk)
+    after = path.stat()
+    if (stat.st_size, stat.st_mtime_ns) != (after.st_size, after.st_mtime_ns):
+        raise RuntimeError("source changed while calculating its fingerprint")
     return {
         "size": stat.st_size,
         "mtime_ns": stat.st_mtime_ns,
+        "sha256": digest.hexdigest(),
+        # Retained for old callers; algorithm explicitly identifies the full hash.
         "sample_sha256": digest.hexdigest(),
+        "hash_algorithm": "sha256-full-v1",
     }
+
+
+@contextmanager
+def project_lock(review_dir: Path):
+    review_dir.mkdir(parents=True, exist_ok=True)
+    descriptor = os.open(review_dir / ".batch.lock", os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as exc:
+            raise RuntimeError("another transcription/review operation is using this Review directory") from exc
+        yield
+    finally:
+        os.close(descriptor)
+
+
+class StateTransaction:
+    """Recover an interrupted registry/manifest/output commit on the next run.
+
+    Caller holds project_lock. A durable before-image precedes all mutations.
+    Review and batch processing use the same journal and cannot interleave.
+    """
+
+    def __init__(self, review_dir: Path, paths=()):
+        self.journal = review_dir / ".state-transaction.json"
+        self.paths = list(dict.fromkeys(Path(path).resolve() for path in paths))
+
+    def begin(self):
+        if self.journal.exists():
+            raise RuntimeError("an interrupted transaction must be recovered first")
+        atomic_write_json(self.journal, {
+            "version": 1,
+            "files": {str(path): base64.b64encode(path.read_bytes()).decode("ascii")
+                      if path.exists() else None for path in self.paths},
+        })
+
+    def commit(self):
+        self.journal.unlink(missing_ok=True)
+        descriptor = os.open(self.journal.parent, os.O_RDONLY)
+        try:
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+
+    def rollback(self):
+        if not self.journal.exists():
+            return False
+        data = json.loads(self.journal.read_text(encoding="utf-8"))
+        if data.get("version") != 1 or not isinstance(data.get("files"), dict):
+            raise RuntimeError("invalid recovery journal; restore the Review directory backup")
+        for name, encoded in data["files"].items():
+            path = Path(name)
+            if encoded is None:
+                path.unlink(missing_ok=True)
+            else:
+                atomic_write_text(path, base64.b64decode(encoded, validate=True).decode("utf-8"))
+        self.commit()
+        return True
 
 
 def parse_extensions(raw: Optional[str]) -> Optional[set[str]]:
@@ -198,8 +269,12 @@ def expected_outputs(
 
 def output_is_valid(path: Path, format_name: str) -> bool:
     try:
-        if not path.is_file() or path.stat().st_size == 0:
+        if not path.is_file():
             return False
+        if path.stat().st_size == 0:
+            return format_name == "srt"
+        if format_name == "vtt":
+            return path.read_text(encoding="utf-8").startswith("WEBVTT\n")
         if format_name == "json":
             payload = json.loads(path.read_text(encoding="utf-8"))
             return (
@@ -274,7 +349,7 @@ def state_is_complete(
 ) -> tuple[bool, str]:
     if not state:
         return False, "not previously processed"
-    if state.get("status") != "complete" or not state.get("completion_state"):
+    if state.get("status") not in ("complete", "awaiting_review") or not state.get("completion_state"):
         return False, f"previous status is {state.get('status', 'unknown')}"
     if state.get("retry_recommended"):
         return False, "a processing stage requested retry"

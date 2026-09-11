@@ -1,2 +1,0 @@
--r requirements.txt
-# Compatibility shim: SpeechBrain is now part of the complete default install.

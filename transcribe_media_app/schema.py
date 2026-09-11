@@ -7,9 +7,9 @@ from typing import Any, Optional
 from . import __version__
 
 SAMPLE_RATE = 16_000
-RESULT_SCHEMA_VERSION = "1.6"
+RESULT_SCHEMA_VERSION = "1.7"
 MANIFEST_SCHEMA_VERSION = "1.0"
-ACOUSTIC_ANALYZER_VERSION = "1.0"
+ACOUSTIC_ANALYZER_VERSION = "2.0"
 HEURISTIC_TONE_VERSION = "1.0"
 
 # Known media extensions are accepted even when a corrupt file cannot be
@@ -80,6 +80,9 @@ class ProcessingSettings:
     acoustic_analysis: bool
     tone_backend: str
     review_formats: tuple[str, ...]
+    known_voices: tuple[str, ...] = ()
+    speaker_learning: bool = True
+    quality: bool = True
 
     def fingerprint_payload(self) -> dict[str, Any]:
         payload = asdict(self)

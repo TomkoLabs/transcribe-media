@@ -534,6 +534,22 @@ class AnalysisTests(unittest.TestCase):
         self.assertIn("sortformer_majority_disagrees", attribution["reasons"])
         self.assertEqual(attribution["assigned_speaker"], "VOICE_0002")
 
+    def test_unresolved_identity_remains_visible_as_uncertain(self):
+        turns = [
+            {"start": 0.0, "end": 1.0, "speaker": "SPEAKER_00",
+             "speaker_identity": {"status": "unresolved_no_confident_known_match"}},
+            {"start": 1.0, "end": 2.0, "speaker": "SPEAKER_UNKNOWN"},
+            {"start": 2.0, "end": 3.0, "speaker": "VOICE_0001",
+             "speaker_identity": {"status": "matched"}},
+        ]
+        annotate_speaker_attribution(turns)
+        self.assertEqual(
+            [turn["speaker_attribution"]["status"] for turn in turns],
+            ["uncertain", "uncertain", "assigned"],
+        )
+        self.assertIn("unresolved_voice_identity", turns[0]["speaker_attribution"]["reasons"])
+        self.assertEqual(turns[0]["speaker"], "SPEAKER_00")
+
     def test_unresolved_sentence_seam_marks_attribution_uncertain(self):
         turns = [
             {
@@ -561,6 +577,75 @@ class AnalysisTests(unittest.TestCase):
 
 
 class SpeakerIdentityTests(unittest.TestCase):
+    def test_known_voices_do_not_enroll_a_changed_recording_as_a_new_person(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "voices.json"
+            registry = VoiceRegistry(path)
+            registry.identify(
+                source_key="first", source_fingerprint="first",
+                local_speakers=["A", "B"],
+                evidence={"A": self._evidence([1, 0]), "B": self._evidence([0, 1])},
+            )
+            original = path.read_bytes()
+            known = VoiceRegistry(path, known_voices=("VOICE_0001", "VOICE_0002"))
+            report = known.identify(
+                source_key="changed-room", source_fingerprint="changed",
+                local_speakers=["A"], evidence={"A": self._evidence([-1, -1])},
+            )
+            self.assertEqual(report["profile_count"], 2)
+            self.assertEqual(report["matches"][0]["status"], "unresolved_no_confident_known_match")
+            self.assertEqual(report["matches"][0]["speaker"], "A")
+            self.assertEqual(len(report["matches"][0]["candidates"]), 2)
+            self.assertEqual(path.read_bytes(), original)
+
+    def test_frozen_registry_matches_without_learning_or_enrollment(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "voices.json"
+            VoiceRegistry(path).identify(
+                source_key="first", source_fingerprint="first",
+                local_speakers=["A"], evidence={"A": self._evidence([1, 0])},
+            )
+            original = path.read_bytes()
+            registry = VoiceRegistry(path, learn=False)
+            report = registry.identify(
+                source_key="second", source_fingerprint="second",
+                local_speakers=["B", "C"],
+                evidence={"B": self._evidence([0.98, 0.2]), "C": self._evidence([-1, 0])},
+            )
+            self.assertEqual(report["matches"][0]["speaker"], "VOICE_0001")
+            self.assertEqual(report["matches"][0]["status"], "matched")
+            self.assertTrue(report["matches"][1]["status"].startswith("unresolved"))
+            self.assertEqual(path.read_bytes(), original)
+            self.assertFalse(report["learning_enabled"])
+
+    def test_roster_excludes_other_profiles_without_forcing_a_match(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "voices.json"
+            VoiceRegistry(path).identify(
+                source_key="first", source_fingerprint="first",
+                local_speakers=["A", "B"],
+                evidence={"A": self._evidence([1, 0]), "B": self._evidence([0, 1])},
+            )
+            registry = VoiceRegistry(path, known_voices=("VOICE_0001",), learn=False)
+            report = registry.identify(
+                source_key="second", source_fingerprint="second",
+                local_speakers=["C"], evidence={"C": self._evidence([0, 1])},
+            )
+            self.assertEqual(report["matches"][0]["speaker"], "C")
+            self.assertEqual(report["profile_count"], 2)
+            candidates = report["matches"][0]["candidates"]
+            self.assertEqual([item["speaker"] for item in candidates], ["VOICE_0001"])
+
+    def test_missing_known_voice_fails_without_creating_registry(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "voices.json"
+            with self.assertRaisesRegex(SpeakerRegistryError, "absent"):
+                VoiceRegistry(path, known_voices=("VOICE_9999",)).validate()
+            self.assertFalse(path.exists())
+            with self.assertRaisesRegex(SpeakerRegistryError, "nonempty"):
+                VoiceRegistry(path, learn=False).validate()
+            self.assertFalse(path.exists())
+
     @staticmethod
     def _evidence(vector, seconds=20.0, cohesion=0.8):
         return {
@@ -938,6 +1023,35 @@ class SpeakerIdentityTests(unittest.TestCase):
 
 
 class SpeakerRefinementTests(unittest.TestCase):
+    def test_word_run_abstains_when_sortformer_supports_original(self):
+        result = self._result()
+        result["segments"][1]["words"][0]["sortformer_speaker"] = "SPEAKER_01"
+        report = self._encoder([0.99, 0.01]).refine([], result)
+        self.assertEqual(report["corrections_applied"], 0)
+        self.assertEqual(report["evaluated_candidates"][0]["decision"], "abstained_sortformer_disagreement")
+        self.assertEqual(result["segments"][1]["speaker"], "SPEAKER_01")
+
+    def test_word_run_abstains_when_third_speaker_is_nearly_tied(self):
+        result = self._result()
+        encoder = self._encoder([1, 0])
+        encoder.extract.return_value["SPEAKER_02"] = {
+            "embedding": [0.99, 0.1], "clean_seconds": 20,
+            "window_count": 5, "cohesion": 0.9,
+        }
+        report = encoder.refine([], result)
+        self.assertEqual(report["corrections_applied"], 0)
+        self.assertEqual(report["evaluated_candidates"][0]["decision"], "abstained_below_confidence_threshold")
+
+    def test_bracketing_voice_cannot_outvote_candidate_acoustic_evidence(self):
+        result = self._fragmented_reply_result()
+        encoder = self._encoder([0.01, 0.99])
+        encoder._encode_interval.side_effect = (
+            lambda _audio, start, end: [0.99, 0.01] if end - start < 0.5 else [0.01, 0.99]
+        )
+        report = encoder.refine([], result)
+        self.assertEqual(report["corrections_applied"], 0)
+        self.assertEqual(report["evaluated_candidates"][0]["decision"], "abstained_candidate_voice_ambiguous")
+
     @staticmethod
     def _result(overlap=False):
         timeline = [
@@ -1536,6 +1650,38 @@ class SortformerTests(unittest.TestCase):
 
 
 class ConfigurationTests(unittest.TestCase):
+    def test_existing_voice_controls_are_validated_and_fingerprinted(self):
+        parser = cli.build_parser()
+        args = parser.parse_args(["--known-voices", "VOICE_0002,VOICE_0001", "--no-speaker-learning"])
+        cli._validate_args(parser, args)
+        settings = cli.processing_settings(args, "pyannote", "off")
+        self.assertEqual(settings.known_voices, ("VOICE_0001", "VOICE_0002"))
+        self.assertFalse(settings.speaker_learning)
+        self.assertEqual(settings.fingerprint_payload()["known_voices"], settings.known_voices)
+        for flags in (
+            ["--known-voices", "SPEAKER_00"],
+            ["--known-voices", "VOICE_0001", "--reset-speaker-registry"],
+            ["--no-speaker-learning", "--no-speaker-identity"],
+        ):
+            with self.subTest(flags=flags), self.assertRaises(SystemExit):
+                cli._validate_args(parser, parser.parse_args(flags))
+
+    def test_gx10_memory_selects_cuda_for_analysis(self):
+        fake_torch = mock.Mock()
+        fake_torch.cuda.is_available.return_value = True
+        fake_torch.cuda.get_device_properties.return_value.total_memory = 128 * 1024**3
+        with mock.patch.dict("sys.modules", {"torch": fake_torch}):
+            runtime = cli.resolve_runtime(cli.build_parser().parse_args([]))
+        self.assertEqual(runtime.analysis_device, "cuda")
+
+    def test_doctor_checks_cuda_kernels_not_just_device_visibility(self):
+        fake_torch = mock.Mock()
+        fake_torch.cuda.is_available.return_value = True
+        fake_torch.ones.side_effect = RuntimeError("no kernel image is available")
+        with mock.patch.dict("sys.modules", {"torch": fake_torch}):
+            with self.assertRaisesRegex(RuntimeError, "no kernel image"):
+                cli._torch_execution_check()
+
     def test_english_is_the_default_transcription_language(self):
         parser = cli.build_parser()
         args = parser.parse_args([])
@@ -1550,7 +1696,7 @@ class ConfigurationTests(unittest.TestCase):
 
     def test_translation_detects_the_source_language_by_default(self):
         parser = cli.build_parser()
-        args = parser.parse_args(["--task", "translate"])
+        args = parser.parse_args(["--no-quality", "--task", "translate"])
         cli._validate_args(parser, args)
         self.assertIsNone(args.language)
 
@@ -1996,8 +2142,10 @@ class FakeBackend:
 
 class FlowTests(unittest.TestCase):
     def _args(self, root, *extra):
+        # These flow fixtures intentionally exercise the transcription-only path.
         return [
             str(root / "Video Source"),
+            "--no-quality",
             "--transcript-dir",
             str(root / "Transcribed"),
             "--review-dir",
@@ -2317,6 +2465,7 @@ class FlowTests(unittest.TestCase):
                 "--hf-token",
                 "test-token",
                 "--no-speaker-identity",
+                "--no-quality",
                 "--no-acoustic",
                 "--no-tone",
             ]

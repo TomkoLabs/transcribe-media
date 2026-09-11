@@ -20,6 +20,16 @@ def _number(value: Any, default: float = 0.0) -> float:
 
 
 def normalize_segments(result: dict[str, Any]) -> list[dict[str, Any]]:
+    def group_identity(words, fallback):
+        identities = [word.get("speaker_identity") for word in words]
+        if identities and all(identity == identities[0] for identity in identities):
+            return identities[0] or fallback
+        unresolved = next((item for item in identities if item and str(item.get("status", "")).startswith("unresolved")), None)
+        if unresolved:
+            return unresolved
+        if any(item and item.get("status") == "human_verified" for item in identities):
+            return {"status": "partially_reviewed"}
+        return fallback
     normalized: list[dict[str, Any]] = []
     for segment in result.get("segments") or []:
         text = str(segment.get("text") or "").strip()
@@ -46,8 +56,8 @@ def normalize_segments(result: dict[str, Any]) -> list[dict[str, Any]]:
                         else None
                     ),
                     "confidence": (
-                        _number(word.get("score"))
-                        if word.get("score") is not None
+                        _number(word.get("score", word.get("confidence")))
+                        if word.get("score", word.get("confidence")) is not None
                         else None
                     ),
                     "speaker": word.get("speaker"),
@@ -59,6 +69,7 @@ def normalize_segments(result: dict[str, Any]) -> list[dict[str, Any]]:
                     ),
                     "speaker_refinement": word.get("speaker_refinement"),
                     "speaker_identity": word.get("speaker_identity"),
+                    "speaker_assignment_fallback": word.get("speaker_assignment_fallback", not bool(word.get("speaker"))),
                 }
             )
 
@@ -92,7 +103,7 @@ def normalize_segments(result: dict[str, Any]) -> list[dict[str, Any]]:
                             current,
                             current[0]["start"],
                             current[-1]["end"],
-                            current[0].get("speaker_identity"),
+                            group_identity(current, segment.get("speaker_identity")),
                         )
                     )
                     current = []
@@ -108,7 +119,7 @@ def normalize_segments(result: dict[str, Any]) -> list[dict[str, Any]]:
                         current,
                         current[0]["start"],
                         current[-1]["end"],
-                        current[0].get("speaker_identity"),
+                        group_identity(current, segment.get("speaker_identity")),
                     )
                 )
         else:
@@ -123,7 +134,7 @@ def normalize_segments(result: dict[str, Any]) -> list[dict[str, Any]]:
                     words,
                     segment.get("start"),
                     segment.get("end"),
-                    segment.get("speaker_identity"),
+                    group_identity(words, segment.get("speaker_identity")),
                 )
             )
 
@@ -184,6 +195,7 @@ def build_turns(
             current = turns[-1]
             if (
                 current["speaker"] == speaker
+                and current.get("speaker_identity") == segment.get("speaker_identity")
                 and start - current["end"] <= max_gap_seconds
                 and end - current["start"] <= max_turn_seconds
             ):
@@ -224,9 +236,8 @@ def annotate_speaker_attribution(
     """Expose evidence conflicts without pretending speaker IDs are certain.
 
     The final assigned speaker remains intact for conversational structure and
-    cross-recording matching. A turn is marked uncertain only when an
-    independent diarizer materially disagrees or a linguistically suspicious
-    label seam reached the acoustic refiner but could not be resolved.
+    cross-recording matching. Unknown or unresolved identities, model conflicts,
+    and acoustically ambiguous corrections are explicitly marked for review.
     """
     suspicious_intervals: list[tuple[float, float, str]] = []
     for candidate in (refinement_report or {}).get("evaluated_candidates") or []:
@@ -240,7 +251,12 @@ def annotate_speaker_attribution(
                 or candidate.get("sandwiched_sentence_continuation")
             )
         )
-        if decision != "abstained_sortformer_disagreement" and not unresolved_seam:
+        candidate_ambiguous = decision == "abstained_candidate_voice_ambiguous"
+        if (
+            decision != "abstained_sortformer_disagreement"
+            and not unresolved_seam
+            and not candidate_ambiguous
+        ):
             continue
         start = _number(candidate.get("start"), -1.0)
         end = _number(candidate.get("end"), -1.0)
@@ -249,15 +265,26 @@ def annotate_speaker_attribution(
         reason = (
             "refinement_model_disagreement"
             if decision == "abstained_sortformer_disagreement"
-            else "unresolved_sentence_continuation"
+            else (
+                "candidate_voice_ambiguous"
+                if candidate_ambiguous else "unresolved_sentence_continuation"
+            )
         )
         suspicious_intervals.append((start, end, reason))
 
     for turn in turns:
         reasons: list[str] = []
+        if turn.get("speaker") in (None, "", "SPEAKER_UNKNOWN"):
+            reasons.append("unknown_speaker")
+        identity = turn.get("speaker_identity") or {}
+        if str(identity.get("status") or "").startswith("unresolved"):
+            reasons.append("unresolved_voice_identity")
         compared_seconds = 0.0
         disagreement_seconds = 0.0
         for word in turn.get("words") or []:
+            if word.get("speaker_assignment_fallback") and (word.get("speaker_identity") or {}).get("status") != "human_verified":
+                if "unsupported_word_assignment" not in reasons:
+                    reasons.append("unsupported_word_assignment")
             secondary = word.get("sortformer_speaker")
             local = word.get("local_speaker")
             if not secondary or not local:
@@ -337,6 +364,36 @@ def annotate_timing_relationships(turns: list[dict[str, Any]]) -> None:
             other["interruption_of"] = turn["id"]
 
 
+def annotate_raw_overlap(turns, timeline):
+    """Expose simultaneous acoustic speech even with exclusive word assignment."""
+    intervals = sorted(timeline, key=lambda item: float(item.get("start", 0)))
+    active = []
+    events = []
+    for item in intervals:
+        start, end = float(item["start"]), float(item["end"])
+        active = [other for other in active if float(other["end"]) > start]
+        for other in active:
+            if other.get("speaker") == item.get("speaker"):
+                continue
+            stop = min(end, float(other["end"]))
+            if stop > start:
+                events.append({"start": start, "end": stop, "duration_seconds": stop - start,
+                               "speakers": [other["speaker"], item["speaker"]]})
+        active.append(item)
+    for turn in turns:
+        turn["acoustic_overlap"] = [event for event in events
+                                    if event["start"] < turn["end"] and event["end"] > turn["start"]]
+        if turn["acoustic_overlap"]:
+            turn.setdefault("observations", []).append({"label": "overlap", "basis": "diarization_timeline",
+                "value": "simultaneous speech; words may be missing", "unit": ""})
+            attribution = turn.setdefault("speaker_attribution", {"status": "uncertain", "reasons": []})
+            attribution["status"] = "uncertain"
+            attribution.setdefault("reasons", []).append("overlapping_speech")
+        # An overlapping start is not sufficient evidence of an interruption.
+        if turn.get("interruption_of"):
+            turn["overlapping_start_with"] = turn.pop("interruption_of")
+
+
 def _dbfs(samples: Any) -> float:
     import numpy as np
 
@@ -358,8 +415,8 @@ def _pitch_statistics(samples: Any) -> dict[str, Optional[float]]:
         np.linspace(0, possible - 1, min(60, possible)).astype(int)
     )
     pitches: list[float] = []
-    min_lag = SAMPLE_RATE // 350
-    max_lag = SAMPLE_RATE // 70
+    min_lag = SAMPLE_RATE // 650
+    max_lag = SAMPLE_RATE // 60
 
     for frame_index in frame_indexes:
         first = frame_index * frame_size
@@ -431,10 +488,18 @@ class AcousticAnalyzer:
             if measurements
             else -30.0
         )
+        levels = {}
+        for turn, item in zip(turns, measurements, strict=True):
+            if not turn.get("acoustic_overlap"):
+                levels.setdefault(turn.get("speaker"), []).append(item["rms_dbfs"])
+        baselines = {speaker: median(values) for speaker, values in levels.items()}
         for turn, acoustic in zip(turns, measurements, strict=True):
-            acoustic["relative_volume_db"] = round(acoustic["rms_dbfs"] - baseline, 2)
+            speaker_baseline = baselines.get(turn.get("speaker"), baseline)
+            acoustic["volume_reference"] = "same_speaker_in_this_recording"
+            acoustic["overlap_contaminated"] = bool(turn.get("acoustic_overlap"))
+            acoustic["relative_volume_db"] = round(acoustic["rms_dbfs"] - speaker_baseline, 2)
             turn["acoustic"] = acoustic
-            observations: list[dict[str, Any]] = []
+            observations: list[dict[str, Any]] = list(turn.get("observations") or [])
 
             def observe(
                 label: str,

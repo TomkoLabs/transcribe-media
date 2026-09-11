@@ -1,0 +1,4 @@
+# Lightweight, model-free CI suite. Install CPU torch separately; see CONTRIBUTING.md.
+numpy==2.3.2
+pandas==2.3.1
+scipy==1.16.1

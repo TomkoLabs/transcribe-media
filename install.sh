@@ -8,11 +8,13 @@ PYTHON="$VENV_DIR/bin/python"
 LAUNCHER="$ROOT/transcribe-media"
 CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/transcribe-media"
 CONFIG_FILE="$CONFIG_DIR/config.env"
+source "$ROOT/scripts/gx10-runtime.sh"
 
 FORCE_CPU=0
 SKIP_SYSTEM_PACKAGES=0
 SKIP_MODEL_DOWNLOADS=0
 NON_INTERACTIVE=0
+MODEL_PREP_OPTIONS=()
 HF_TOKEN_VALUE="${HF_TOKEN:-${HUGGINGFACE_TOKEN:-}}"
 export PATH="$TOOLS_DIR:$PATH"
 
@@ -70,6 +72,10 @@ install_system_packages() {
         run_privileged apt-get update || warn "Could not run apt-get update automatically."
         run_privileged apt-get install -y ffmpeg curl ca-certificates git libsndfile1 xz-utils || \
             warn "Some apt packages could not be installed automatically."
+        if [[ $FORCE_CPU -eq 0 && "$(uname -m)" == "aarch64" ]]; then
+            run_privileged apt-get install -y build-essential cmake pkg-config libopenblas-dev || \
+                warn "GX10 source-build prerequisites could not be installed automatically."
+        fi
     elif command -v dnf >/dev/null 2>&1; then
         run_privileged dnf install -y ffmpeg curl ca-certificates git libsndfile xz || \
             warn "Some dnf packages could not be installed. FFmpeg may require RPM Fusion."
@@ -163,22 +169,36 @@ install_local_ffmpeg() {
 }
 
 install_python_environment() {
+    local gpu_candidate=0
+    local gx10=0 torch_index="https://download.pytorch.org/whl/cu126"
+    local torch_spec="torch==2.8.0" gpu_requirements="$ROOT/requirements-gpu.txt"
+    if [[ $FORCE_CPU -eq 0 ]] && command -v nvidia-smi >/dev/null 2>&1 && nvidia-smi >/dev/null 2>&1; then
+        gpu_candidate=1
+        MODEL_PREP_OPTIONS=(--device cuda)
+    elif [[ $FORCE_CPU -eq 0 ]]; then
+        warn "No working NVIDIA driver detected. Installing CPU mode; for an RTX 3080, fix nvidia-smi before running this installer."
+    fi
+    if [[ $gpu_candidate -eq 1 && "$(uname -m)" == "aarch64" ]]; then
+        gx10=1
+        torch_index="https://download.pytorch.org/whl/cu129"
+        torch_spec="torch==2.8.0+cu129"
+        gpu_requirements="$ROOT/requirements-gx10.txt"
+        MODEL_PREP_OPTIONS=(--device cuda)
+        # Fail before clearing a working environment if the toolkit is missing.
+        gx10_preflight
+    fi
+
     log "Creating a managed Python 3.11 environment"
     "$UV" python install 3.11
     "$UV" venv --python 3.11 --clear "$VENV_DIR"
 
-    local gpu_candidate=0
-    if [[ $FORCE_CPU -eq 0 ]] && command -v nvidia-smi >/dev/null 2>&1 && nvidia-smi >/dev/null 2>&1; then
-        gpu_candidate=1
-    fi
-
     if [[ $gpu_candidate -eq 1 ]]; then
-        log "NVIDIA GPU detected; installing PyTorch 2.8 with CUDA 12.6 runtime"
+        log "NVIDIA GPU detected; installing PyTorch 2.8 from $torch_index"
         if ! "$UV" pip install --python "$PYTHON" \
-            --index-url https://download.pytorch.org/whl/cu126 \
-            torch==2.8.0 torchvision==0.23.0 torchaudio==2.8.0; then
-            warn "CUDA PyTorch installation failed; installing CPU wheels instead."
-            gpu_candidate=0
+            --index-url "$torch_index" \
+            "$torch_spec" torchvision==0.23.0 torchaudio==2.8.0; then
+            echo "CUDA wheels failed to install; the GPU installation is incomplete. Fix the error and rerun ./install.sh (or choose --cpu explicitly)." >&2
+            return 1
         fi
     fi
 
@@ -196,8 +216,11 @@ install_python_environment() {
         # matched torch/vision/audio set and must not silently upgrade one member.
         "$UV" pip install --python "$PYTHON" \
             -r "$ROOT/requirements.txt" \
-            -r "$ROOT/requirements-gpu.txt" \
-            torch==2.8.0 torchvision==0.23.0 torchaudio==2.8.0
+            -r "$gpu_requirements" \
+            "$torch_spec" torchvision==0.23.0 torchaudio==2.8.0
+        if [[ $gx10 -eq 1 ]]; then
+            build_gx10_ctranslate2
+        fi
         if ! "$PYTHON" - <<'PYTEST'
 import torch
 assert torch.cuda.is_available(), "PyTorch reports CUDA unavailable"
@@ -206,14 +229,13 @@ assert value == 2, "CUDA arithmetic test failed"
 print(torch.cuda.get_device_name(0))
 PYTEST
         then
-            warn "The CUDA environment did not validate; switching to CPU PyTorch."
-            "$UV" pip install --python "$PYTHON" --force-reinstall \
-                --index-url https://download.pytorch.org/whl/cpu \
-                torch==2.8.0 torchvision==0.23.0 torchaudio==2.8.0
+            echo "CUDA execution failed; check the NVIDIA driver/toolkit and rerun ./install.sh. Use --cpu only if CPU operation is intended." >&2
+            return 1
         fi
     else
         log "Installing transcription, speaker, acoustic, and tone dependencies"
-        "$UV" pip install --python "$PYTHON" -r "$ROOT/requirements.txt"
+        "$UV" pip install --python "$PYTHON" -r "$ROOT/requirements.txt" \
+            torch==2.8.0 torchvision==0.23.0 torchaudio==2.8.0
     fi
 }
 
@@ -235,7 +257,7 @@ configure_diarization() {
         return
     fi
 
-    log "Optional one-time speaker-detection setup"
+    log "One-time speaker-detection setup (recommended for quality)"
     "$LAUNCHER" --configure || true
 }
 
@@ -247,31 +269,33 @@ install_command() {
     fi
 }
 
-install_system_packages
-install_uv
-install_local_ffmpeg
-chmod +x "$LAUNCHER" "$ROOT/transcribe_media.py"
-install_python_environment
-mkdir -p "$ROOT/Video Source" "$ROOT/Transcribed" "$ROOT/Review"
-if [[ -s "$ROOT/Review/speaker_registry.json" ]]; then
-    warn "Preserving the existing persistent voice registry in $ROOT/Review."
-    warn "Git pull and reinstall do not reset ignored Review state or restart VOICE numbering."
-    warn "To intentionally start over, run: $LAUNCHER --reset-speaker-registry"
-fi
-configure_diarization
-install_command
-
-log "Validating the installation"
-"$LAUNCHER" --doctor
-
-if [[ $SKIP_MODEL_DOWNLOADS -eq 0 ]]; then
-    log "Downloading and validating the default models"
-    if ! "$LAUNCHER" --prepare-models; then
-        warn "Model preparation failed. Rerun 'transcribe-media --prepare-models' while online."
+main() {
+    install_system_packages
+    install_uv
+    install_local_ffmpeg
+    chmod +x "$LAUNCHER" "$ROOT/transcribe_media.py"
+    install_python_environment
+    mkdir -p "$ROOT/Video Source" "$ROOT/Transcribed" "$ROOT/Review"
+    if [[ -s "$ROOT/Review/speaker_registry.json" ]]; then
+        warn "Preserving the existing persistent voice registry in $ROOT/Review."
+        warn "Git pull and reinstall do not reset ignored Review state or restart VOICE numbering."
+        warn "To intentionally start over, run: $LAUNCHER --reset-speaker-registry"
     fi
-fi
+    configure_diarization
+    install_command
 
-cat <<EOF
+    log "Validating the installation"
+    "$LAUNCHER" --doctor "${MODEL_PREP_OPTIONS[@]}"
+
+    if [[ $SKIP_MODEL_DOWNLOADS -eq 0 ]]; then
+        log "Downloading and validating the default models"
+        if ! "$LAUNCHER" --prepare-models "${MODEL_PREP_OPTIONS[@]}"; then
+            warn "Model preparation failed. Rerun 'transcribe-media --prepare-models' while online."
+            exit 1
+        fi
+    fi
+
+    cat <<EOF
 
 Installation complete.
 
@@ -279,12 +303,20 @@ Put media in:
   $ROOT/Video Source
 
 Then run:
-  transcribe-media
-
-Or use the repository launcher directly:
   $LAUNCHER
 
+Quality mode is enabled by default: English, 2-3 speakers, reviewed voice profiles.
+After processing, open this file in your browser to confirm the initial voices:
+  $ROOT/Review/speaker-reviews/index.html
+Export decisions there, then apply them:
+  $LAUNCHER --apply-speaker-review /path/to/downloaded.decisions.json
+
 Useful checks:
-  transcribe-media --doctor
-  transcribe-media --configure
+  $LAUNCHER --doctor
+  $LAUNCHER --help
 EOF
+}
+
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+    main
+fi

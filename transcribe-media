@@ -41,5 +41,10 @@ PY
 if [[ -n "$CUDA_LIBS" ]]; then
     export LD_LIBRARY_PATH="$CUDA_LIBS${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 fi
+for CT2_LIB in "$ROOT/.tools/ctranslate2-gx10/lib" "$ROOT/.tools/ctranslate2-gx10/lib64"; do
+    if [[ -d "$CT2_LIB" ]]; then
+        export LD_LIBRARY_PATH="$CT2_LIB${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+    fi
+done
 
 exec "$PYTHON" "$ROOT/transcribe_media.py" "$@"

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+from html import escape
 from pathlib import Path
 from typing import Any
 
@@ -289,12 +290,20 @@ def render_txt(payload: dict[str, Any]) -> str:
                 str(turn.get("speaker") or "SPEAKER_UNKNOWN") for turn in turns
             )
         )
+    labels = {profile["voice_id"]: profile for profile in payload.get("speaker_profiles", [])}
+    display = []
+    for voice in active:
+        profile = labels.get(voice, {})
+        annotations = [str(profile["label"])] if profile.get("label") and profile["label"] != voice else []
+        if profile.get("role") in ("adult", "child"):
+            annotations.append(str(profile["role"]))
+        display.append(voice + (f" ({'; '.join(annotations)})" if annotations else ""))
     lines = [
-        "ANALYSIS-READY TRANSCRIPT",
+        "DRAFT: SPEAKER REVIEW REQUIRED" if (payload.get("speaker_review") or {}).get("pending") else "ANALYSIS-READY TRANSCRIPT",
         "=========================",
         f"Source: {source.get('relative_path') or source.get('path')}",
         f"Language: {language.get('output') or language.get('detected') or 'unknown'}",
-        f"Speakers: {', '.join(active) if active else 'none detected'}",
+        f"Speakers: {', '.join(display) if display else 'none detected'}",
         "ASR wording is preserved and not summarized. Speaker attribution and",
         "selective vocal-tone labels are probabilistic; verify consequential passages",
         "against the recording. Full timestamps, evidence, and scores are in Review.",
@@ -353,7 +362,7 @@ def render_vtt(segments: list[dict[str, Any]]) -> str:
                 (
                     f"{format_timestamp(segment.get('start'))} --> "
                     f"{format_timestamp(segment.get('end'))}",
-                    f"<{speaker}>{text}",
+                    f"<v {escape(str(speaker))}>{escape(text)}</v>",
                 )
             )
         )

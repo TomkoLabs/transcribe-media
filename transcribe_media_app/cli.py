@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import fcntl
 import getpass
 import importlib.util
+import json
 import logging
 import os
 import platform
+import re
 import shlex
 import subprocess
 import sys
@@ -173,7 +176,8 @@ def archive_speaker_state(review_dir: Path) -> Path | None:
     """Move identity/manifest state to a private, recoverable backup directory."""
     registry_path = review_dir / "speaker_registry.json"
     manifest_path = review_dir / "transcription_manifest.json"
-    state_paths = [path for path in (registry_path, manifest_path) if path.exists()]
+    review_packets = review_dir / "speaker-reviews"
+    state_paths = [path for path in (registry_path, manifest_path, review_packets) if path.exists()]
     if not state_paths:
         return None
 
@@ -183,7 +187,7 @@ def archive_speaker_state(review_dir: Path) -> Path | None:
         os.fchmod(descriptor, 0o600)
         fcntl.flock(descriptor, fcntl.LOCK_EX)
         # Recheck after acquiring the same lock used by registry updates.
-        state_paths = [path for path in (registry_path, manifest_path) if path.exists()]
+        state_paths = [path for path in (registry_path, manifest_path, review_packets) if path.exists()]
         if not state_paths:
             return None
         backup_root = review_dir / "speaker-registry-backups"
@@ -208,7 +212,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="transcribe-media",
         description=(
-            "Private, local-first batch transcription with durable rerun state."
+            "Private, local-first transcription. Defaults to quality mode for "
+            "two adults with an optional third speaker."
+        ),
+        epilog=(
+            "Quick start: ./install.sh, put recordings in 'Video Source', then "
+            "run ./transcribe-media. Open Review/speaker-reviews/index.html to "
+            "confirm voices. See README.md for the short workflow and "
+            "QUALITY_GUIDE.md for advanced controls."
         ),
     )
     parser.add_argument(
@@ -226,6 +237,17 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--extensions", help="comma-separated extension allow-list")
 
     parser.add_argument("--model", default="large-v3", help="Whisper model name")
+    parser.add_argument(
+        "--quality", action=argparse.BooleanOptionalAction, default=True,
+        help=("quality preset (default: enabled): reviewed voice references, "
+              "2–3 speakers, full decoding, no inferred tone; --no-quality "
+              "restores the legacy automatic-enrollment/batched workflow"),
+    )
+    parser.add_argument("--review-speakers", action="store_true", help="build the offline speaker review index without loading models")
+    parser.add_argument("--refresh-voices", action="store_true", help="rematch cached recordings against verified profiles without rerunning ASR")
+    parser.add_argument("--apply-speaker-review", metavar="DECISIONS_JSON", help="apply exported human speaker decisions and regenerate transcripts without ASR")
+    parser.add_argument("--merge-voices", nargs=2, metavar=("DUPLICATE_ID", "CANONICAL_ID"), help="merge a reviewed duplicate profile into a canonical ID and update transcripts")
+    parser.add_argument("--evaluate-voices", action="store_true", help="evaluate verified references across held-out recordings; no model loading")
     parser.add_argument(
         "--language",
         help=(
@@ -278,6 +300,20 @@ def build_parser() -> argparse.ArgumentParser:
         help="disable automatic anonymous voice matching across recordings",
     )
     parser.set_defaults(speaker_identity=True)
+    parser.add_argument(
+        "--known-voices",
+        help=(
+            "comma-separated existing VOICE IDs for these recordings; restrict "
+            "matching to these profiles and never enroll new IDs"
+        ),
+    )
+    parser.add_argument(
+        "--no-speaker-learning",
+        dest="speaker_learning",
+        action="store_false",
+        help="match existing voice profiles without updating or enrolling profiles",
+    )
+    parser.set_defaults(speaker_learning=True)
     parser.add_argument(
         "--no-speaker-refinement",
         dest="speaker_refinement",
@@ -397,6 +433,15 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def _validate_args(parser: argparse.ArgumentParser, args: argparse.Namespace) -> None:
+    if sum(bool(getattr(args, key)) for key in ("review_speakers", "refresh_voices", "apply_speaker_review", "merge_voices", "evaluate_voices")) > 1:
+        parser.error("choose one speaker review action per command")
+    if args.quality:
+        if args.speakers is None and args.min_speakers is None and args.max_speakers is None:
+            args.min_speakers, args.max_speakers = 2, 3
+        if args.tone_backend == "auto":
+            args.tone_backend = "off"
+        if args.batch_size is None:
+            args.batch_size = 1
     if args.language is None:
         # English is the product's primary, validated use case. Forcing it avoids
         # unreliable first-30-second detection on recordings that begin with
@@ -444,6 +489,28 @@ def _validate_args(parser: argparse.ArgumentParser, args: argparse.Namespace) ->
         args.diarization_backend = "auto"
     if args.diarization_backend == "off":
         args.speaker_identity = False
+    if args.known_voices is not None:
+        voices = [value.strip() for value in args.known_voices.split(",")]
+        if not voices or any(
+            re.fullmatch(r"VOICE_\d{4,}", value) is None for value in voices
+        ):
+            parser.error(
+                "--known-voices requires comma-separated IDs such as VOICE_0001,VOICE_0002"
+            )
+        args.known_voices = tuple(sorted(set(voices)))
+    else:
+        args.known_voices = ()
+    if (args.known_voices or not args.speaker_learning) and not args.speaker_identity:
+        parser.error("voice matching controls require speaker identity")
+    if args.quality and (not args.speaker_identity or not args.align or args.task != "transcribe"):
+        parser.error(
+            "quality mode requires speaker identity, word alignment and transcription; "
+            "remove the conflicting option or explicitly use --no-quality"
+        )
+    if args.reset_speaker_registry and (args.known_voices or not args.speaker_learning):
+        parser.error(
+            "registry reset cannot be combined with existing-voice matching controls"
+        )
     if (
         args.diarization_backend in {"sortformer", "ensemble"}
         and args.max_speakers is not None
@@ -515,7 +582,9 @@ def configure(args: argparse.Namespace) -> int:
     token = resolve_hf_token(args.hf_token)
     if not token and not args.non_interactive and sys.stdin.isatty():
         print("A Hugging Face token enables the higher-quality pyannote diarizer.")
-        print("Leave blank to keep the token-free SpeechBrain fallback.")
+        print("First accept model access: https://huggingface.co/pyannote/speaker-diarization-community-1")
+        print("Create a read token: https://huggingface.co/settings/tokens")
+        print("Leave blank to use a token-free speaker fallback.")
         token = getpass.getpass("Hugging Face read token: ").strip() or None
     if not token:
         print("No token saved. Token-free speaker clustering remains available.")
@@ -673,6 +742,9 @@ def processing_settings(
         acoustic_analysis=args.acoustic,
         tone_backend=tone_backend,
         review_formats=tuple(args.review_formats),
+        known_voices=tuple(args.known_voices or ()),
+        speaker_learning=args.speaker_learning,
+        quality=args.quality,
     )
 
 
@@ -765,7 +837,14 @@ def _ctranslate2_check() -> str:
             "PyTorch sees CUDA, but CTranslate2 sees no CUDA device. "
             "Run ./install.sh to repair the GPU runtime."
         )
-    compute_types = ctranslate2.get_supported_compute_types("cuda", 0)
+    try:
+        compute_types = ctranslate2.get_supported_compute_types("cuda", 0)
+    except RuntimeError as exc:
+        raise RuntimeError(
+            "CTranslate2 cannot execute on CUDA. On GX10, its published ARM wheel "
+            "is CPU-only; run ./install.sh to build the pinned CUDA version. "
+            f"Original error: {exc}"
+        ) from exc
     if "float16" not in compute_types:
         raise RuntimeError("CUDA device 0 does not report float16 support")
     return (
@@ -773,7 +852,30 @@ def _ctranslate2_check() -> str:
     )
 
 
-def doctor() -> int:
+def _torch_execution_check() -> str:
+    import torch
+
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    value = (torch.ones(2, device=device) + 1).sum().item()
+    if value != 4:
+        raise RuntimeError("tensor arithmetic failed")
+    if device == "cuda":
+        matrix = torch.ones((32, 32), dtype=torch.float16, device=device)
+        if (matrix @ matrix)[0, 0].item() != 32:
+            raise RuntimeError("CUDA float16 matrix multiplication failed")
+        signal = torch.ones((1, 1, 8), device=device)
+        kernel = torch.ones((1, 1, 3), device=device)
+        if torch.nn.functional.conv1d(signal, kernel).sum().item() != 18:
+            raise RuntimeError("CUDA convolution failed")
+        torch.cuda.synchronize()
+        return (
+            f"{torch.__version__}; {platform.machine()}; {torch.cuda.get_device_name(0)}; "
+            f"compute capability {torch.cuda.get_device_capability(0)}; CUDA kernels passed"
+        )
+    return f"{torch.__version__}; {platform.machine()}; CPU arithmetic passed"
+
+
+def doctor(args: Optional[argparse.Namespace] = None) -> int:
     print(f"transcribe-media {__version__} installation check")
     checks = [
         _doctor_check("Python", lambda: platform.python_version()),
@@ -813,25 +915,28 @@ def doctor() -> int:
         ),
     ]
 
-    def torch_check() -> str:
-        import torch
-
-        value = (torch.ones(2) + 1).sum().item()
-        if value != 4:
-            raise RuntimeError("tensor arithmetic failed")
-        return f"{torch.__version__}; CUDA available={torch.cuda.is_available()}"
-
-    checks.append(_doctor_check("PyTorch arithmetic", torch_check))
+    checks.append(_doctor_check("PyTorch execution", _torch_execution_check))
     nemo_version = package_version("nemo-toolkit")
     print(
         "[INFO] NVIDIA NeMo / Sortformer: "
         f"{nemo_version or 'not installed (optional on CPU)'}"
     )
-    token = resolve_hf_token()
+    if args is None:
+        parser = build_parser()
+        args = parser.parse_args([])
+        _validate_args(parser, args)
+    token = resolve_hf_token(args.hf_token)
     token_status = "configured" if token else "not configured"
     print(f"[INFO] Higher-quality pyannote token: {token_status}")
-    runtime = resolve_runtime(build_parser().parse_args([]))
+    if args.device == "cuda" and not _cuda_available():
+        checks.append(False)
+        print("[FAIL] CUDA was requested but PyTorch cannot use it. Check nvidia-smi and rerun ./install.sh.")
+    runtime = resolve_runtime(args)
     print(f"[INFO] Selected runtime: {runtime.description}")
+    diarization, tone, messages = resolve_analysis_backends(args, token)
+    print(f"[INFO] Mode: {'quality' if args.quality else 'legacy'}; diarization: {diarization}; tone: {tone}")
+    for message in messages:
+        print(f"[INFO] {message}")
     print("[INFO] Media is processed locally; no runtime upload service is used.")
     return 0 if all(checks) else 1
 
@@ -852,6 +957,27 @@ def _exercise_models(
     tone_name: str,
     backend: WhisperXBackend,
 ) -> None:
+    # Silence can be removed entirely by VAD, so a successful WAV transcription
+    # alone does not prove the CTranslate2 encoder/decoder can execute on the GPU.
+    import numpy as np
+    from faster_whisper.tokenizer import Tokenizer
+
+    whisper_model = backend.model.model
+    tokenizer = Tokenizer(
+        whisper_model.hf_tokenizer,
+        whisper_model.model.is_multilingual,
+        task=args.task,
+        language=args.language or "en",
+    )
+    mel_bins = whisper_model.feat_kwargs.get("feature_size", 80)
+    encoded = whisper_model.encode(np.zeros((mel_bins, 3000), dtype=np.float32))
+    generated = whisper_model.model.generate(
+        encoded, [list(tokenizer.sot_sequence)], max_length=8, beam_size=1
+    )
+    if not generated:
+        raise RuntimeError("Whisper encoder/decoder kernel self-test failed")
+    del encoded, generated
+    print(f"[OK] Whisper encoder and decoder executed on {backend.runtime.device}.")
     with tempfile.TemporaryDirectory(prefix="transcribe-media-selftest-") as directory:
         sample = Path(directory) / "one-second-silence.wav"
         _write_silence(sample)
@@ -957,6 +1083,7 @@ def prepare_models(args: argparse.Namespace) -> int:
     backend, runtime = WhisperXBackend.create(
         args.model, args.language, args.task, runtime, token
     )
+    backend.quality = args.quality
     try:
         _exercise_models(args, token, runtime, diarization_name, tone_name, backend)
     finally:
@@ -1150,6 +1277,7 @@ def _processing_payload(
         "sortformer_timeline": result.get("sortformer_timeline"),
         "diarization_ensemble": result.get("diarization_ensemble"),
         "speaker_identity": result.get("speaker_identity"),
+        "asr_diagnostics": result.get("asr_diagnostics", []),
         "overlap_events": overlap_events,
         "limitations": limitations,
     }
@@ -1176,10 +1304,13 @@ def process_one(
     started_utc = utc_now()
     degraded = list(initial_degraded)
     LOG.info("[%s] stage 1/7: decode and transcribe", relative)
-    result, audio, provenance, backend_degraded = backend.transcribe(
-        source, settings.align, args.verbose
+    from .cache import transcribe_cached
+    result, audio, provenance, backend_degraded = transcribe_cached(
+        backend, source, fingerprint, settings, args,
     )
     degraded.extend(backend_degraded)
+    if settings.quality and any(str(item).startswith("alignment:") for item in backend_degraded):
+        raise RuntimeError("quality mode requires successful word alignment before reviewing speaker evidence")
 
     if diarizer is not None:
         LOG.info("[%s] stage 2/7: anonymous speaker labeling", relative)
@@ -1242,6 +1373,8 @@ def process_one(
     elif diarizer is not None:
         LOG.info("[%s] stage 3/7: acoustic speaker refinement disabled", relative)
 
+    local_result = copy.deepcopy(result)
+    evidence = {}
     if settings.speaker_identity:
         LOG.info(
             "[%s] stage 4/7: whole-recording voice reconciliation and "
@@ -1249,6 +1382,8 @@ def process_one(
             relative,
         )
         if identity_encoder is None or voice_registry is None:
+            if settings.quality:
+                raise RuntimeError("quality mode requires the speaker identity encoder and registry")
             degraded.append("speaker identity: encoder or registry is unavailable")
         else:
             try:
@@ -1339,14 +1474,21 @@ def process_one(
                     "merged_local_clusters": identity_report["merged_local_clusters"],
                 }
             except Exception as exc:
+                if settings.quality:
+                    raise RuntimeError(f"quality voice identification failed: {_safe_error(exc)}") from exc
                 degraded.append(f"speaker identity: {_safe_error(exc)}")
     elif diarizer is not None:
         LOG.info("[%s] stage 4/7: persistent voice matching disabled", relative)
 
     LOG.info("[%s] stage 5/7: structure words, turns, and overlap", relative)
+    if settings.quality:
+        from .review import restore_reviewed_choices
+        restore_reviewed_choices(resolve_paths(args).review_dir, relative.as_posix(), fingerprint, local_result, result)
     segments = normalize_segments(result)
     turns = build_turns(segments)
     annotate_speaker_attribution(turns, result.get("speaker_refinement"))
+    from .analysis import annotate_raw_overlap
+    annotate_raw_overlap(turns, result.get("speaker_timeline") or [])
 
     if acoustic_analyzer is not None:
         LOG.info("[%s] stage 6/7: measured acoustic observations", relative)
@@ -1362,7 +1504,8 @@ def process_one(
     if tone_estimator is not None:
         LOG.info("[%s] stage 6/7: approximate turn-level tone", relative)
         try:
-            tone_estimator.estimate(audio, turns)
+            tone_turns = [turn for turn in turns if not turn.get("acoustic_overlap")]
+            tone_estimator.estimate(audio, tone_turns)
             scored_turns = sum(
                 bool((turn.get("tone") or {}).get("scores")) for turn in turns
             )
@@ -1381,7 +1524,7 @@ def process_one(
             scored_windows = sum(
                 len((turn.get("tone") or {}).get("windows") or []) for turn in turns
             )
-            if turns and scored_turns == 0:
+            if tone_turns and scored_turns == 0:
                 raise RuntimeError("tone estimator produced no usable turn scores")
             if unavailable_turns:
                 degraded.append(
@@ -1426,6 +1569,20 @@ def process_one(
     # The canonical result must contain the exact normalized segments used to
     # derive turns, including diarization labels and word confidence values.
     payload["segments"] = segments
+    if voice_registry is not None:
+        active_ids = {turn["speaker"] for turn in turns}
+        payload["speaker_profiles"] = [profile for profile in voice_registry.profiles_for_review()
+                                       if profile["voice_id"] in active_ids]
+    if settings.quality and voice_registry is not None:
+        from .review import save_review, packet_path
+        review_path = packet_path(resolve_paths(args).review_dir, relative.as_posix())
+        payload["speaker_review"] = {
+            "pending": [item["local_speaker"] for item in (result.get("speaker_identity") or {}).get("matches", [])
+                        if item["status"].startswith("unresolved")],
+            "review_file": str(review_path.with_suffix(".html")),
+        }
+        save_review(resolve_paths(args).review_dir, source, relative.as_posix(), fingerprint,
+                    local_result, evidence, payload, outputs, voice_registry, audio)
     LOG.info("[%s] stage 7/7: atomically write outputs", relative)
     write_outputs(outputs, payload)
     release_accelerator_memory(runtime.device)
@@ -1445,6 +1602,19 @@ def process_one(
 
 
 def run_batch(args: argparse.Namespace) -> int:
+    from .storage import project_lock, StateTransaction
+    paths = resolve_paths(args)
+    try:
+        with project_lock(paths.review_dir):
+            if StateTransaction(paths.review_dir).rollback():
+                print("Recovered an interrupted transcript/voice-state transaction.")
+            return _run_batch(args)
+    except (RuntimeError, OSError) as exc:
+        print(f"Processing could not continue: {_safe_error(exc)}", file=sys.stderr)
+        return 1
+
+
+def _run_batch(args: argparse.Namespace) -> int:
     paths = resolve_paths(args)
     if not paths.source_dir.exists():
         if args.source_dir:
@@ -1494,6 +1664,7 @@ def run_batch(args: argparse.Namespace) -> int:
     print(f"Primary transcripts: {paths.transcript_dir}")
     print(f"Review artifacts: {paths.review_dir}")
     print(f"Discovered {len(files)} media file(s).")
+    print(f"Mode: {'quality (reviewed voice references)' if args.quality else 'legacy (automatic enrollment)'}")
     print(
         "Speech language: "
         + (args.language if args.language is not None else "automatic detection")
@@ -1569,6 +1740,9 @@ def run_batch(args: argparse.Namespace) -> int:
             match_margin=settings.speaker_match_margin,
             local_merge_threshold=settings.speaker_merge_threshold,
             enrollment_seconds=settings.speaker_enrollment_seconds,
+            known_voices=settings.known_voices,
+            learn=settings.speaker_learning,
+            reviewed=settings.quality,
         )
         try:
             registry_summary = voice_registry.validate()
@@ -1618,8 +1792,9 @@ def run_batch(args: argparse.Namespace) -> int:
             )
         else:
             print(
-                "Speaker identity state: empty registry; active voices will be "
-                "allocated after each complete recording is reconciled."
+                "Speaker identity state: empty registry; first identities require human review."
+                if settings.quality else
+                "Speaker identity state: empty registry; active voices will be allocated after each complete recording is reconciled."
             )
     pending: list[tuple[Path, Path, dict[str, Any], dict[str, Path]]] = []
     skipped = 0
@@ -1669,6 +1844,11 @@ def run_batch(args: argparse.Namespace) -> int:
     os.environ["HF_HUB_OFFLINE"] = "1"
     os.environ["TRANSFORMERS_OFFLINE"] = "1"
     print(f"Runtime: {runtime.description}")
+    print(
+        f"Models: ASR {settings.model}; diarization {diarization_name}; "
+        f"speaker range {settings.min_speakers or 'auto'}–{settings.max_speakers or 'auto'}; "
+        f"tone {tone_name}"
+    )
     run_started = utc_now()
     try:
         backend, actual_runtime = WhisperXBackend.create(
@@ -1686,6 +1866,7 @@ def run_batch(args: argparse.Namespace) -> int:
         runtime = actual_runtime
         label = "Runtime adjustment" if same_device else "Runtime fallback"
         print(f"{label}: {runtime.description}")
+    backend.quality = settings.quality
 
     try:
         diarizer = create_diarizer(
@@ -1754,6 +1935,7 @@ def run_batch(args: argparse.Namespace) -> int:
                 diarizer = None
         else:
             diarizer = None
+    print(f"Loaded diarization: {getattr(diarizer, 'name', 'unavailable' if diarization_name != 'off' else 'off')}")
     identity_encoder = None
     if (
         settings.speaker_identity or settings.speaker_refinement
@@ -1762,6 +1944,7 @@ def run_batch(args: argparse.Namespace) -> int:
             identity_encoder = SpeakerIdentityEncoder(
                 runtime.analysis_device,
                 classifier=getattr(diarizer, "classifier", None),
+                quality=settings.quality,
             )
         except Exception as exc:
             initial_degraded.append(
@@ -1796,6 +1979,12 @@ def run_batch(args: argparse.Namespace) -> int:
     processed = failed = degraded_count = 0
     interrupted = False
     for source, relative, fingerprint, outputs in pending:
+        from .storage import StateTransaction
+        from .review import packet_path
+        review_packet = packet_path(paths.review_dir, relative.as_posix())
+        transaction = StateTransaction(paths.review_dir, [paths.review_dir / "speaker_registry.json",
+            manifest.path, *outputs.values(), review_packet, review_packet.with_suffix(".html")])
+        transaction.begin()
         key = relative.as_posix()
         entry_base = {
             "source_path": str(source),
@@ -1837,11 +2026,13 @@ def run_batch(args: argparse.Namespace) -> int:
             needs_retry = any(
                 item not in expected_degraded for item in (result.degraded_stages or [])
             )
+            review_pending = len((payload.get("speaker_review") or {}).get("pending", []))
             manifest.update(
                 key,
                 {
                     **entry_base,
-                    "status": "degraded" if needs_retry else "complete",
+                    "status": "degraded" if needs_retry else ("awaiting_review" if review_pending else "complete"),
+                    "speaker_review_pending": review_pending,
                     "completion_state": not needs_retry,
                     "completed_utc": utc_now(),
                     "elapsed_seconds": round(result.elapsed_seconds or 0.0, 3),
@@ -1867,6 +2058,7 @@ def run_batch(args: argparse.Namespace) -> int:
                     }
                 )
             processed += 1
+            transaction.commit()
             if needs_retry:
                 degraded_count += 1
                 print(
@@ -1875,8 +2067,11 @@ def run_batch(args: argparse.Namespace) -> int:
                     file=sys.stderr,
                 )
             else:
-                print(f"DONE    {relative} -> {outputs['txt']}")
+                suffix = f" ({review_pending} voice(s) awaiting human review)" if review_pending else ""
+                print(f"DONE    {relative} -> {outputs['txt']}{suffix}")
         except KeyboardInterrupt:
+            transaction.rollback()
+            manifest = ManifestStore(manifest.path)
             interrupted = True
             manifest.update(
                 key,
@@ -1893,6 +2088,8 @@ def run_batch(args: argparse.Namespace) -> int:
             )
             break
         except Exception as exc:
+            transaction.rollback()
+            manifest = ManifestStore(manifest.path)
             failed += 1
             error = _safe_error(exc)
             manifest.update(
@@ -1937,6 +2134,9 @@ def run_batch(args: argparse.Namespace) -> int:
         f"{degraded_count} degraded. "
         f"Manifest: {manifest.path}"
     )
+    if settings.quality:
+        from .review import review_index
+        print(f"Speaker review: {review_index(paths.review_dir)}")
     return 130 if interrupted else (1 if failed or degraded_count else 0)
 
 
@@ -1964,8 +2164,30 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             logging.getLogger(logger_name).setLevel(logging.WARNING)
     if args.configure:
         return configure(args)
+    if args.review_speakers or args.refresh_voices or args.apply_speaker_review or args.merge_voices or args.evaluate_voices:
+        from .storage import project_lock, StateTransaction
+        from . import review
+        paths = resolve_paths(args)
+        try:
+            with project_lock(paths.review_dir):
+                StateTransaction(paths.review_dir).rollback()
+                if args.review_speakers:
+                    print(f"Open: {review.review_index(paths.review_dir)}")
+                elif args.refresh_voices:
+                    print(json.dumps(review.refresh_reviews(paths.review_dir), indent=2))
+                elif args.apply_speaker_review:
+                    print(json.dumps(review.apply_review(paths.review_dir, args.apply_speaker_review), indent=2))
+                elif args.merge_voices:
+                    print(json.dumps(review.merge_project_profiles(paths.review_dir, *args.merge_voices), indent=2))
+                else:
+                    from .evaluation import evaluate_registry
+                    print(json.dumps(evaluate_registry(paths.review_dir), indent=2))
+            return 0
+        except (OSError, ValueError, RuntimeError) as exc:
+            print(f"Speaker review failed: {_safe_error(exc)}", file=sys.stderr)
+            return 1
     if args.doctor:
-        return doctor()
+        return doctor(args)
     if args.prepare_models:
         try:
             return prepare_models(args)
