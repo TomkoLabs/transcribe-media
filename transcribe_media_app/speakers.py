@@ -246,6 +246,10 @@ class VoiceRegistry:
             ):
                 raise SpeakerRegistryError(f"speaker profile {voice_id!r} is invalid")
             centroid = profile.get("centroid") or []
+            # A human can name a speaker before enough clean audio is available.
+            # Keep that identity durable without inventing a biometric vector.
+            if not centroid and profile.get("observations") == [] and profile.get("reference_status") == "needs_review":
+                continue
             try:
                 valid_dimension = int(dimension)
             except (TypeError, ValueError) as exc:
@@ -313,29 +317,61 @@ class VoiceRegistry:
         return [{"voice_id": key, "label": item.get("label", key),
                  "role": item.get("role", "unspecified"),
                  "verified_windows": sum(bool(obs.get("verified")) for obs in item["observations"]),
-                 "verified_sessions": len({obs["source_fingerprint"] for obs in item["observations"] if obs.get("verified")})}
+                 "verified_sessions": len({obs["source_fingerprint"] for obs in item["observations"] if obs.get("verified")}),
+                 "verified_seconds": round(sum(obs.get("clean_seconds", 0.) for obs in item["observations"] if obs.get("verified")), 1),
+                 "archived": bool(item.get("archived")),
+                 "training_status": "ready" if self._reference_conditions(item) else
+                                    ("collecting" if any(obs.get("verified") for obs in item["observations"]) else "untrained")}
                 for key, item in sorted(data["profiles"].items())]
+
+    def reviewed_profile_ids(self, receipts):
+        """Recover draft IDs from older review receipts, including later merges."""
+        with self._locked():
+            data = self._load_unlocked()
+        mapping = {}
+        for receipt in receipts:
+            mapping.update(data.get("applied_reviews", {}).get(receipt, {}))
+        return {key: data.get("aliases", {}).get(value, value) for key, value in mapping.items()}
+
+    @staticmethod
+    def _reference_conditions(profile):
+        """Independent support from long clips or a consistent set of short clips.
+
+        Short utterances contribute embeddings individually, never stitched audio.
+        Two disjoint pools must agree, so a single short clip cannot authorize a match.
+        """
+        sessions: dict[str, list] = {}
+        for observation in profile["observations"]:
+            if observation.get("verified") and observation.get("clean_seconds", 0.) >= 0.8:
+                sessions.setdefault(observation["source_fingerprint"], []).append(observation)
+        conditions = []
+        for observations in sessions.values():
+            long = [obs["embedding"] for obs in observations if obs["clean_seconds"] >= 2.5]
+            if len(long) >= 2:
+                conditions.append(long)
+            short = sorted((obs for obs in observations if obs["clean_seconds"] < 2.5),
+                           key=lambda obs: (obs.get("start", 0.), obs["observation_id"]))
+            if len(short) >= 5 and sum(obs["clean_seconds"] for obs in short) >= 8.:
+                vectors = [obs["embedding"] for obs in short]
+                center = _centroid(vectors)
+                if all(cosine_similarity(vector, center) >= 0.70 for vector in vectors):
+                    conditions.append([_centroid(vectors[::2]), _centroid(vectors[1::2])])
+        return conditions
 
     @staticmethod
     def profile_similarity(profile, embedding, reviewed=False):
-        if not profile.get("observations"):
+        if profile.get("archived") or not profile.get("observations"):
             return -1.0
         if not reviewed:
             return cosine_similarity(embedding, profile["centroid"])
-        sessions: dict[str, list] = {}
-        for observation in profile["observations"]:
-            if observation.get("verified") and observation.get("clean_seconds", 0.) >= 2.5:
-                sessions.setdefault(observation["source_fingerprint"], []).append(observation["embedding"])
         scores = []
-        for vectors in sessions.values():
-            if len(vectors) < 2:
-                continue
-            # Two supporting reviewed clips are required in a recording condition.
+        for vectors in VoiceRegistry._reference_conditions(profile):
             support = sorted((cosine_similarity(embedding, vector) for vector in vectors), reverse=True)
             scores.append(min(cosine_similarity(embedding, _centroid(vectors)), support[1]))
         return max(scores, default=-1.0)
 
-    def confirm_references(self, references, new_profiles=None, review_id=None, replace_source_fingerprint=None):
+    def confirm_references(self, references, new_profiles=None, review_id=None, replace_source_fingerprint=None,
+                           profile_updates=None):
         """Apply validated human decisions atomically; never reinterpret a score as probability."""
         with self._locked():
             data = self._load_unlocked()
@@ -364,14 +400,21 @@ class VoiceRegistry:
                 data["embedding_model"]["dimension"] = len(observation["embedding"])
                 observation.update(verified=True, review_id=review_id, verified_utc=utc_now())
                 self._add_observation(data, voice_id, observation)
-            for voice_id in mapping.values():
-                if not data["profiles"][voice_id]["observations"]:
-                    raise SpeakerRegistryError("a new profile needs at least one clean reviewed reference window")
+            for voice_id, metadata in (profile_updates or {}).items():
+                if voice_id not in data["profiles"]:
+                    raise SpeakerRegistryError(f"unknown profile to edit: {voice_id}")
+                label = metadata.get("label", data["profiles"][voice_id].get("label", voice_id))
+                role = metadata.get("role", data["profiles"][voice_id].get("role", "unspecified"))
+                archived = metadata.get("archived", data["profiles"][voice_id].get("archived", False))
+                if not isinstance(label, str) or not label.strip() or len(label) > 80 or any(ord(c) < 32 for c in label) or role not in ("adult", "child", "unspecified") or not isinstance(archived, bool):
+                    raise SpeakerRegistryError("profile edits need a short label, valid role and boolean archived state")
+                data["profiles"][voice_id].update(label=label.strip(), role=role, archived=archived)
             self._refresh_profiles(data)
             if review_id:
                 data.setdefault("applied_reviews", {})[review_id] = mapping
             data.setdefault("audit", []).append({"action": "human_review", "review_id": review_id,
-                "created_utc": utc_now(), "references": len(references), "new_profiles": mapping})
+                "created_utc": utc_now(), "references": len(references), "new_profiles": mapping,
+                "profile_updates": profile_updates or {}})
             data["revision"] += 1
             self._save_unlocked(data)
             return mapping
@@ -402,6 +445,8 @@ class VoiceRegistry:
                 "known VOICE IDs are absent from this registry: "
                 + ", ".join(sorted(missing))
             )
+        if any(data["profiles"][key].get("archived") for key in self.known_voices):
+            raise SpeakerRegistryError("known VOICE IDs include an archived profile; restore it before matching")
         if not self.learn and not data["profiles"]:
             raise SpeakerRegistryError(
                 "--no-speaker-learning requires an existing, nonempty voice registry"
@@ -601,6 +646,7 @@ class VoiceRegistry:
         for voice_id, profile in data["profiles"].items():
             observations = profile.get("observations") or []
             if not observations:
+                profile["centroid"] = []
                 profile["reference_status"] = "needs_review"
                 profile["sessions_seen"] = 0
                 profile["clean_seconds"] = 0.
@@ -753,7 +799,7 @@ class VoiceRegistry:
             data = self._load_unlocked()
             self._validate_matching_policy(data)
             profiles = data["profiles"]
-            profile_ids = list(self.known_voices) or sorted(profiles)
+            profile_ids = list(self.known_voices) or sorted(key for key in profiles if not profiles[key].get("archived"))
             initial_profile_count = len(profile_ids)
             dimension = data["embedding_model"].get("dimension")
 
@@ -935,7 +981,7 @@ class VoiceRegistry:
             # Retain alternatives for review without exposing biometric vectors.
             if self.reviewed and grouped_evidence[group]:
                 candidates = sorted(((key, cosine_similarity(grouped_evidence[group]["embedding"], profiles[key]["centroid"]))
-                                     for key in profile_ids), key=lambda pair: pair[1], reverse=True)
+                                     for key in profile_ids if profiles[key].get("centroid")), key=lambda pair: pair[1], reverse=True)
             candidate_report = [
                 {"speaker": voice_id, "similarity": round(score, 4),
                  "score_kind": "centroid_cosine", "probability": None}

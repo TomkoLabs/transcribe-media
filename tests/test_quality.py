@@ -230,13 +230,28 @@ class EvidenceTests(unittest.TestCase):
         self.assertEqual(result, {})
         encoded.assert_not_called()
 
-    def test_disagreement_and_clipping_cannot_train_profiles(self):
+    def test_disagreement_is_manual_only_and_clipping_is_unusable(self):
         timeline = [{"start": 0., "end": 6., "speaker": "A"}]
         encoded = mock.Mock(return_value=np.array([1., 0.]))
         words = {"segments": [{"words": [{"start": 0., "end": 6., "word": "hello", "speaker": "A", "sortformer_speaker": "B"}]}]}
-        self.assertEqual(extract_reference_evidence(np.ones(6 * SAMPLE_RATE) * .1, timeline, words, encoded), {})
+        disputed = extract_reference_evidence(np.ones(6 * SAMPLE_RATE) * .1, timeline, words, encoded)["A"]
+        self.assertEqual(disputed["window_count"], 0)
+        self.assertEqual(disputed["clean_seconds"], 0)
+        self.assertTrue(disputed["windows"][0]["reference_eligible"])
+        self.assertFalse(disputed["windows"][0]["automatic_reference_eligible"])
+        encoded.reset_mock()
         self.assertEqual(extract_reference_evidence(np.ones(6 * SAMPLE_RATE), timeline, {}, encoded), {})
         encoded.assert_not_called()
+
+    def test_disputed_majority_does_not_move_the_automatic_reference_anchor(self):
+        timeline = [{'start': i*7., 'end': i*7.+6., 'speaker': 'A'} for i in range(5)]
+        words = {'segments': [{'words': [{**turn, 'word': 'hello',
+                  'sortformer_speaker': 'B' if i < 3 else 'A'} for i, turn in enumerate(timeline)]}]}
+        encoded = mock.Mock(side_effect=[np.array([0., 1.])]*3 + [np.array([1., 0.])]*2)
+        result = extract_reference_evidence(np.ones(35*SAMPLE_RATE)*.1, timeline, words, encoded)['A']
+        self.assertEqual(result['window_count'], 2)
+        self.assertEqual(result['embedding'], [1., 0.])
+        self.assertFalse(any(w['automatic_reference_eligible'] for w in result['windows'][:3]))
 
     def test_mixed_cluster_requires_review_even_with_a_strong_centroid(self):
         with tempfile.TemporaryDirectory() as directory:

@@ -13,5 +13,6 @@ fi
 
 bash -n install.sh transcribe-media scripts/gx10-runtime.sh scripts/check.sh
 shellcheck -x install.sh transcribe-media scripts/gx10-runtime.sh scripts/check.sh
+node tests/test_review_state.cjs
 "$TEST_PYTHON" -m compileall -q transcribe_media.py transcribe_media_app tests
 "$TEST_PYTHON" -m unittest discover -s tests -v

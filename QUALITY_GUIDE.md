@@ -49,20 +49,24 @@ The page uses a sibling WAV, so keep the HTML and WAV together. On a headless GX
 copy this review folder to your desktop for listening, then apply the exported
 decisions on the machine holding the original project and recordings.
 
-1. Listen to clips from several parts of each local speaker group. A diarizer's
+1. Start in **Needs attention**, which leaves uncertain groups unassigned.
+   **Already assigned** contains confident automatic matches and your selections.
+   Listen to clips from several parts of each local speaker group. A diarizer's
    group can contain mistakes; a good first clip does not verify the whole group.
 2. Select an existing VOICE ID if it is the same person. Otherwise choose
-   **Create Adult A**, **Create Adult B**, **Create Child**, or add another label.
+   **Adult A**, **Adult B**, **Child**, or add another label under **People & profile labels**.
    The role is your annotation; it is not an automated child detector.
-3. If a group mixes people, expand its turns and override the affected turn's
-   identity. Narrow its start/end seconds to correct only part of a turn.
-   Existing word timestamps determine assignment by word midpoint. Multiple
-   disjoint ranges can also be supplied in the decision JSON.
+3. Each clip card displays its timestamp, excerpt and assigned person. If a group
+   mixes people, use **Change only this clip** for an exception, or expand
+   **All soundbites** and correct a whole turn or part of it. Multiple time
+   corrections can be added and removed in the page. Existing word timestamps
+   determine assignment by word midpoint; corrections do not rewrite words.
 4. Uncheck clips with the wrong speaker, overlap, noise or unsuitable content.
-   An acoustic outlier is initially unchecked but can be explicitly selected
+   An acoustic outlier or model-disputed clip is initially unchecked but can be explicitly selected
    after assigning it to its actual speaker. A window spanning different
    reviewed identities is excluded from reference training.
-5. Export decisions, then apply the downloaded JSON:
+5. Click **Export review**, then **Copy apply command**, and run the copied command
+   in the project terminal. Refresh other recordings if already processed:
 
 ```bash
 ./transcribe-media --apply-speaker-review /path/to/downloaded.decisions.json
@@ -85,21 +89,54 @@ error that should repeatedly run ASR. A weak or unknown voice stays unresolved
 instead of being forced onto an adult profile. Human approval identifies who
 spoke; it does not certify ASR wording or eliminate acoustic overlap uncertainty.
 
-The new profile must have at least one usable selected clip. Very short/noisy
-utterances may need an existing profile or remain unknown. Automatic identity
-matching requires stronger support: at least two reference clips of 2.5 seconds
-or more from one verified recording condition, adequate query evidence, a strong
-score and margin, and agreement across the query's windows. A short child reply
-can be manually labeled without being trusted as an automatic identification
-reference. Nonverbal vocalizations are not guaranteed to be transcribed.
+A new person can be saved **with no usable reference audio**. Their transcript
+label is valid independently of whether the voice profile can identify them
+automatically later. Profiles display **untrained** (no verified clips),
+**collecting** (some clips, insufficient support), or **ready** (a reference
+condition meets the support rules). Ready is not an accuracy guarantee.
+
+Automatic matching needs either two verified clips of at least 2.5 seconds, or
+at least five consistent clips of 0.8–under 2.5 seconds totaling at least eight
+seconds, **from the same recording**. The short-clip route compares every clip
+with the set's centroid, then requires agreement with two disjoint embedding
+pools. It does not stitch audio. Query-evidence, score, margin, child-role and
+agreement checks still apply. Shorter speech can be labeled, but cannot serve
+as a reference. Nonverbal vocalizations are not guaranteed to be transcribed.
+
+### Save drafts and manage people
+
+**Import saved review** restores an exported decisions JSON before it has been
+applied. It checks the recording and validates all choices before changing the
+page. A local browser draft is also saved when browser storage is available;
+export is the portable backup. **Reset draft** restores the last applied review.
+The page stays fully offline: export/import cannot directly write transcript or
+registry files. Applying through the copied command keeps the workflow to one
+HTML page and one command, without installing or securing a local web service.
+
+**People & profile labels** lets you add people, edit labels and adult/child roles,
+remove unused draft people, and archive existing profiles. Removing a draft person
+leaves their draft assignments unknown; archiving keeps historical IDs and labels
+while excluding that person from future automatic matching. Applied label edits
+update registered transcript outputs. Existing IDs are preserved; archive rather
+than deleting a person referenced by previous recordings. If using `--known-voices`,
+remove an archived ID from that roster before applying or processing.
+
+Automatic assignments are not exported as human approval and do not train
+themselves. To add references for an already confident person, listen and use
+**Confirm this person & learn**. An uncertain group's explicit assignment approves
+its selected suitable references; clip/turn corrections take precedence. A window
+crossing different or unresolved identities cannot train a profile.
 
 ## How the references improve
 
 Reference extraction keeps real contiguous waveform windows, trims boundaries,
-excludes detected overlap and diarizer disagreement, rejects severe clipping and
+excludes detected overlap, rejects severe clipping and
 very low energy, and checks acoustic consistency. It does not splice disjoint
 replies into artificial speech. These checks are useful filters, not proof that
-a clip has no background noise, music or speaker contamination.
+a clip has no background noise, music or speaker contamination. Diarizer-disputed
+clips are excluded from automatic evidence but retained, initially unchecked,
+for deliberate human review when otherwise usable. Pauses between transcribed
+turns no longer disqualify the surrounding reviewed speech window.
 
 Verified clips remain separate from automatic observations and are never evicted
 by the automatic observation limit. Quality matching uses only verified clips.
@@ -108,12 +145,15 @@ trusted reference material or replace confirmed anchors. This limits the feedbac
 loop in which an early wrong match makes later wrong matches look stronger.
 
 Each person's verified recordings provide separate condition prototypes. A match
-needs support from a condition centroid and two individual clips, plus a margin
+needs support from a condition centroid and two individual clips (or the two
+short-clip pools described above), plus a margin
 over competing people and agreement across query windows. Confirming another
 room/microphone/session can add useful coverage without averaging that condition
 away. The number of reference conditions can also affect false-match rates, so
 the thresholds remain conservative heuristics requiring evaluation. Child-labeled
 profiles use a stricter acceptance threshold. Pitch is not used to infer age.
+Learning means accumulating verified speaker embeddings; it does not fine-tune
+the speech-recognition or speaker-embedding neural networks.
 
 The candidate list displays **cosine similarity, not probability**. A similarity
 of 0.82 does not mean an 82% chance of identity. Diagnostic centroid scores shown
@@ -174,6 +214,18 @@ reruns when the source and local transcript boundaries are unchanged. If those
 boundaries or source change, the run preserves the old outputs and asks for a
 fresh review rather than silently applying obsolete labels. To explicitly start
 that recording's review again, archive its HTML/JSON/WAV review packet first.
+
+New exports are complete snapshots: removing a turn/time override in the page
+and applying the export removes that override. Older exports remain supported
+as incremental edits. Reapplying a revised draft reuses its previously created
+people, including after merges. Reapplying the most recent file is a no-op;
+applying an older snapshot after a newer edit restores that snapshot's choices.
+
+After upgrading, `./transcribe-media --review-speakers` rebuilds existing HTML
+pages with the current UI and profile catalog without loading models. Existing
+failed decisions exports can be retried directly when their source is unchanged.
+Newly extracted short/disputed reference windows require processing the recording
+again; the review update cannot recover embeddings absent from an old packet.
 
 Processing, review application and merging use one project lock and a recoverable
 journal for the registry, manifest and transcript outputs. After interruption,

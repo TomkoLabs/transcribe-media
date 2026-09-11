@@ -5,7 +5,7 @@ from typing import Any
 
 from .schema import SAMPLE_RATE
 
-EVIDENCE_VERSION = "2.0"
+EVIDENCE_VERSION = "2.1"
 
 
 def extract_reference_evidence(audio, timeline, result, encode):
@@ -26,28 +26,27 @@ def extract_reference_evidence(audio, timeline, result, encode):
         for start, end in intervals:
             # Keep the true waveform and trim change boundaries. Never stitch replies.
             start, end = start + 0.10, end - 0.10
-            if end - start < 0.8:
+            if end - start < 0.8 - 1e-6:
                 rejected["short"] += 1
                 continue
             cursor = start
-            while end - cursor >= 0.8:
+            while end - cursor >= 0.8 - 1e-6:
                 stop = min(end, cursor + 6.0)
                 candidates.append((cursor, stop))
                 cursor = stop
         # Spread a bounded number of windows across the whole recording.
-        if len(candidates) > 32:
-            indexes = np.linspace(0, len(candidates) - 1, 32).astype(int)
+        if len(candidates) > 64:
+            indexes = np.linspace(0, len(candidates) - 1, 64).astype(int)
             candidates = [candidates[index] for index in indexes]
         windows = []
         for start, end in candidates:
-            duration = end - start
+            duration = round(end - start, 4)
             relevant = [word for word in own_words
                         if float(word["start"]) < end and float(word["end"]) > start]
             disputed = any(word.get("sortformer_ambiguous") or word.get("sortformer_speaker") not in (None, speaker)
                            for word in relevant)
             if disputed:
                 rejected["model_disagreement"] += 1
-                continue
             speech = sum(max(0., min(end, float(word["end"])) - max(start, float(word["start"])))
                          for word in relevant if any(c.isalnum() for c in str(word.get("word", word.get("text", "")))))
             if words and speech < min(0.6, duration * 0.25):
@@ -71,18 +70,20 @@ def extract_reference_evidence(audio, timeline, result, encode):
                             "rms_dbfs": round(20 * float(np.log10(rms)), 2),
                             "clipped_fraction": round(clipped, 4),
                             "reference_eligible": duration >= 0.8 and speech >= 0.2,
-                            "automatic_reference_eligible": duration >= 2.5 and speech >= 0.6})
+                            "model_disagreement": disputed,
+                            "automatic_reference_eligible": not disputed and duration >= 2.5 and speech >= 0.6})
         if not windows:
             continue
         matrix = np.asarray([window["embedding"] for window in windows], dtype=np.float32)
         pairwise = matrix @ matrix.T
-        medoid = int(np.argmax(np.median(pairwise, axis=1)))
+        eligible = np.asarray([not w["model_disagreement"] for w in windows])
+        indexes = np.flatnonzero(eligible)
+        # Manual-only clips must not move the automatic reference anchor.
+        medoid = int(indexes[np.argmax(np.median(pairwise[np.ix_(indexes, indexes)], axis=1))]) if len(indexes) else int(np.argmax(np.median(pairwise, axis=1)))
         agreement = pairwise[:, medoid]
-        keep = agreement >= 0.45
+        keep = (agreement >= 0.45) & eligible
         retained = matrix[keep]
-        if not len(retained):
-            continue
-        centroid = np.mean(retained, axis=0)
+        centroid = np.mean(retained if len(retained) else matrix, axis=0)
         centroid /= max(float(np.linalg.norm(centroid)), 1e-8)
         for index, window in enumerate(windows):
             window["cohesion_similarity"] = round(float(matrix[index] @ centroid), 4)
@@ -95,7 +96,7 @@ def extract_reference_evidence(audio, timeline, result, encode):
             "embedding": [round(float(value), 7) for value in centroid],
             "clean_seconds": round(sum(window["duration"] for window in good), 3),
             "available_clean_seconds": round(sum(end - start for start, end in intervals), 3),
-            "window_count": len(good), "cohesion": round(float(np.median(retained @ centroid)), 4),
+            "window_count": len(good), "cohesion": round(float(np.median(retained @ centroid)), 4) if len(retained) else 0.,
             "recognized_word_count": len(own_words),
             "recognized_speech_seconds": round(sum(max(0, float(w["end"]) - float(w["start"])) for w in own_words), 3),
             "word_timing_available": bool(words), "lexical_filter_applied": bool(words),

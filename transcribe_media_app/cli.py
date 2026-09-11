@@ -2176,7 +2176,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 elif args.refresh_voices:
                     print(json.dumps(review.refresh_reviews(paths.review_dir), indent=2))
                 elif args.apply_speaker_review:
-                    print(json.dumps(review.apply_review(paths.review_dir, args.apply_speaker_review), indent=2))
+                    applied = review.apply_review(paths.review_dir, args.apply_speaker_review)
+                    print(json.dumps(applied, indent=2))
+                    if not applied.get("already_applied"):
+                        print("Speaker corrections applied to the transcript.")
+                        if applied.get("profiles_needing_audio"):
+                            print("Some profiles are still collecting voice references. Their transcript labels are saved; add more clean reviewed clips over time.")
+                    print("Open the review index again for remaining uncertain voices. Use --refresh-voices to update other cached recordings.")
                 elif args.merge_voices:
                     print(json.dumps(review.merge_project_profiles(paths.review_dir, *args.merge_voices), indent=2))
                 else:

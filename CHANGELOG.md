@@ -1,5 +1,27 @@
 # Changelog
 
+## 1.13.0 — 2026-09-11
+
+- Rebuilt offline speaker review with distinct clip cards, current identities,
+  confident preselection, an uncertainty-first queue, and clip/turn/time corrections.
+- Added saved-review import, local drafts, profile label/role editing, draft-person
+  removal, archiving, and a copyable apply command. No web service is required.
+- Human labels now save even without usable reference audio. Separated transcript
+  correction from training readiness and removed an overly strict ASR coverage
+  check that rejected reviewed speech windows containing pauses.
+- Consistent sets of short, verified clips can support matching. Disputed model
+  windows remain manual-only evidence; automatic matches cannot verify themselves.
+- Preserved draft-to-person mappings on reapply/rerun/merge, supported restoring
+  older decision snapshots, and added transactional propagation of profile edits.
+- `--review-speakers` refreshes existing pages and the profile catalog without ASR.
+  Old decision exports remain supported when their source and boundaries match.
+
+This update changes review and reference handling, with no larger model, Ollama
+service or additional GPU requirement. Existing 3080/GX10 hardware targets and
+accuracy-validation limits remain unchanged. Model-free regression tests and a
+synthetic browser workflow validate behavior, not measured transcription or
+speaker-identification accuracy.
+
 ## 1.12.0 — 2026-09-11
 
 Quality is now the default for `./transcribe-media`, including sequential

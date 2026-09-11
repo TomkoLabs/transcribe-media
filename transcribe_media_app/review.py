@@ -6,6 +6,7 @@ import html
 import json
 import math
 import os
+import re
 import wave
 from pathlib import Path
 
@@ -132,6 +133,7 @@ def save_review(review_dir, source, source_key, fingerprint, local_result, evide
         if previous.get("fingerprint") == fingerprint and _segmentation_key(previous["local_result"]) == _segmentation_key(local_result):
             packet["applied_decisions"] = previous.get("applied_decisions", {})
             packet["receipts"] = previous.get("receipts", [])
+            packet["new_profile_ids"] = previous.get("new_profile_ids", {})
     path.parent.mkdir(parents=True, exist_ok=True)
     path.parent.chmod(0o700)
     audio_path = path.with_suffix(".wav")
@@ -156,33 +158,60 @@ def save_review(review_dir, source, source_key, fingerprint, local_result, evide
 
 def render_review(path, packet):
     turns = build_turns(normalize_segments(packet["local_result"]))
+    annotate_speaker_attribution(turns, packet["local_result"].get("speaker_refinement"))
+    from .analysis import annotate_raw_overlap
+    annotate_raw_overlap(turns, packet["local_result"].get("speaker_timeline", []))
     public = {"review_id": packet["review_id"], "packet": path.name,
               "source": packet["source_key"], "profiles": packet["profiles"],
               "pending": packet["pending"], "matches": packet["matches"],
               "turns": turns,
+              "applied_decisions": {**packet.get("applied_decisions", {}), "profile_updates": {}},
+              "new_profile_ids": packet.get("new_profile_ids", {}),
+              "draft_revision": stable_hash({key: packet.get(key) for key in
+                                             ("applied_decisions", "profiles", "new_profile_ids")})[:16],
               "mixed": [key for key, item in packet["evidence"].items() if item.get("suspected_mixed_speakers")],
               "windows": {key: [{k: v for k, v in window.items() if k != "embedding"}
                                  for window in item.get("windows", [])]
                           for key, item in packet["evidence"].items()}}
     data = json.dumps(public, ensure_ascii=False).replace("<", "\\u003c")
-    document = _REVIEW_HTML.replace("__REVIEW_DATA__", data).replace(
-        "__AUDIO__", html.escape(path.with_suffix(".wav").name, quote=True))
+    parts = {"__REVIEW_DATA__": data, "__AUDIO__": html.escape(path.with_suffix(".wav").name, quote=True),
+             "__REVIEW_STATE__": Path(__file__).with_name("review_state.js").read_text(encoding="utf-8")}
+    document = re.sub(r"__REVIEW_DATA__|__REVIEW_STATE__|__AUDIO__", lambda match: parts[match.group()],
+                      Path(__file__).with_name("review_page.html").read_text(encoding="utf-8"))
     atomic_write_text(path.with_suffix(".html"), document)
 
 
 def review_index(review_dir):
     root = Path(review_dir) / "speaker-reviews"
     rows = []
+    catalog = VoiceRegistry(Path(review_dir) / "speaker_registry.json").profiles_for_review()
     for path in sorted(root.glob("*.json")):
         packet = json.loads(path.read_text(encoding="utf-8"))
         if packet.get("version") != 1:
             continue
-        rows.append(f'<li><a href="{html.escape(path.with_suffix(".html").name)}">'
-                    f'{html.escape(packet["source_key"])}</a> — {len(packet["pending"])} voice(s) awaiting review</li>')
+        # Regenerate existing pages after an app update without loading any models.
+        packet["profiles"] = catalog
+        if not packet.get("new_profile_ids"):
+            packet["new_profile_ids"] = VoiceRegistry(Path(review_dir) / "speaker_registry.json").reviewed_profile_ids(packet.get("receipts", []))
+        packet["matches"] = packet["payload"].get("speaker_identity", {}).get("matches", packet["matches"])
+        render_review(path, packet)
+        count = len(packet["pending"])
+        rows.append((not count, packet["source_key"], f'<li><a href="{html.escape(path.with_suffix(".html").name)}">'
+                    f'{html.escape(packet["source_key"])}</a><span class="{"pending" if count else "done"}">'
+                    f'{str(count) + " voice(s) need review" if count else "Speakers assigned"}</span></li>'))
     index = root / "index.html"
-    atomic_write_text(index, '<!doctype html><meta charset="utf-8"><title>Speaker reviews</title>'
-                      '<h1>Speaker reviews</h1><p>Open a recording, listen, choose identities, then export decisions. '
-                      'Apply the downloaded JSON with --apply-speaker-review.</p><ul>' + "".join(rows) + '</ul>')
+    atomic_write_text(index, '<!doctype html><html lang="en"><meta charset="utf-8">'
+                      '<meta name="viewport" content="width=device-width,initial-scale=1"><title>Speaker reviews</title>'
+                      '<style>body{font:16px/1.5 system-ui;background:#eef2f7;color:#182235;max-width:1000px;margin:auto;padding:24px}'
+                      'h1{color:#13243c}ul{list-style:none;padding:0}li{display:flex;justify-content:space-between;gap:18px;flex-wrap:wrap;background:white;'
+                      'border:1px solid #a7b8ce;border-radius:8px;padding:22px;margin:16px 0}a{color:#174bb5;font-weight:650;overflow-wrap:anywhere}'
+                      'span{padding:3px 10px;border-radius:5px}.pending{background:#ffdf91}.done{background:#d1f1e3}code{background:white;padding:4px}</style>'
+                      '<h1>Speaker reviews</h1><p>Start with recordings that need attention. Confident matches are already selected; '
+                      'you only need to identify uncertain voices and correct exceptions.</p>'
+                      '<p>Each page supports clip playback, profile edits, saved-review import and export. '
+                      'After exporting, use its <strong>Copy apply command</strong> button and run that command in your project terminal.</p>'
+                      '<ul>' + "".join(row for _, _, row in sorted(rows)) + '</ul>'
+                      + ('' if rows else '<p>No recording reviews yet. Add media and run <code>./transcribe-media</code>.</p>') + '</html>')
     return index
 
 
@@ -197,7 +226,7 @@ def _resolve_choices(packet, decisions):
     local_ids = {str(turn.get("local_speaker") or turn["speaker"]) for turn in turns}
     if set(assignments) - local_ids or set(overrides) - {turn["id"] for turn in turns}:
         raise SpeakerRegistryError("review references a speaker or turn absent from this recording")
-    if not assignments and not overrides and not decisions.get("range_overrides"):
+    if not assignments and not overrides and not decisions.get("range_overrides") and not decisions.get("profile_updates") and decisions.get("format_version") != 2:
         raise SpeakerRegistryError("review contains no decisions")
     for turn in turns:
         local = str(turn.get("local_speaker") or turn["speaker"])
@@ -246,7 +275,9 @@ def _review_references(packet, turns, excluded):
             if len(covered) != 1:
                 continue  # A clip crossing different identities cannot train either.
             profile, coverage = next(iter(covered.items()))
-            if profile in (None, "unknown") or coverage < 0.90 * window["duration"]:
+            # Diarization intervals include pauses that ASR turns don't cover.
+            # Those silent gaps do not invalidate an otherwise reviewed voice.
+            if profile in (None, "unknown") or coverage < min(0.2, window["duration"] * 0.25):
                 continue
             observation = VoiceRegistry._observation(packet["source_key"], packet["fingerprint"]["sha256"],
                 f'{local}:{window["start"]:.4f}:{window["end"]:.4f}',
@@ -273,16 +304,36 @@ def apply_review(review_dir, decision_path):
     if source_fingerprint(Path(packet["source"])) != packet["fingerprint"]:
         raise SpeakerRegistryError("source recording changed after this review was created")
     receipt = stable_hash(decisions)
-    if receipt in packet.get("receipts", []):
+    if packet.get("receipts", [])[-1:] == [receipt]:
         return {"already_applied": True, "pending": len(packet["pending"])}
     # A second import updates the same source's decisions rather than erasing prior review.
-    combined = copy.deepcopy(packet.get("applied_decisions", {}))
+    if decisions.get("format_version") not in (None, 2):
+        raise SpeakerRegistryError("unsupported review decision format")
+    combined = {} if decisions.get("format_version") == 2 else copy.deepcopy(packet.get("applied_decisions", {}))
     for key in ("assignments", "turn_overrides", "new_profiles"):
+        if not isinstance(decisions.get(key, {}), dict):
+            raise SpeakerRegistryError(f"{key} must be an object")
         combined.setdefault(key, {}).update(decisions.get(key, {}))
+    combined["format_version"] = decisions.get("format_version", combined.get("format_version"))
+    combined["profile_updates"] = decisions.get("profile_updates", {})
+    if not isinstance(combined["profile_updates"], dict) or any(not isinstance(item, dict) for item in combined["profile_updates"].values()):
+        raise SpeakerRegistryError("profile updates must contain profile objects")
     combined["range_overrides"] = decisions.get("range_overrides", combined.get("range_overrides", []))
     combined["exclude_windows"] = decisions.get("exclude_windows", combined.get("exclude_windows", []))
-    turns = _resolve_choices(packet, combined)
+    if not isinstance(combined["exclude_windows"], list) or any(not isinstance(item, str) for item in combined["exclude_windows"]):
+        raise SpeakerRegistryError("excluded reference clips must be a list of clip IDs")
+    # Reopening a saved draft must not create a second ID for the same draft person.
     registry = VoiceRegistry(Path(review_dir) / "speaker_registry.json")
+    prior_ids = registry.reviewed_profile_ids(packet.get("receipts", []))
+    prior_ids.update(packet.get("new_profile_ids", {}))
+    packet["new_profile_ids"] = prior_ids
+    for key in ("assignments", "turn_overrides"):
+        combined[key] = {local: prior_ids.get(choice, choice) if isinstance(choice, str) else choice
+                         for local, choice in combined[key].items()}
+    for item in combined["range_overrides"] if isinstance(combined["range_overrides"], list) else []:
+        if isinstance(item, dict) and isinstance(item.get("profile"), str):
+            item["profile"] = prior_ids.get(item["profile"], item["profile"])
+    turns = _resolve_choices(packet, combined)
     profiles = {item["voice_id"] for item in registry.profiles_for_review()}
     used = {turn["review_choice"] for turn in turns} - {None, "unknown"}
     if any(not isinstance(key, str) for key in used):
@@ -300,19 +351,22 @@ def apply_review(review_dir, decision_path):
             raise SpeakerRegistryError("new profile needs a short label and adult/child/unspecified role")
         new_profiles[key] = {"label": label, "role": role}
     references = _review_references(packet, turns, set(combined["exclude_windows"]))
-    if set(new_profiles) - {item["profile"] for item in references}:
-        raise SpeakerRegistryError("a new voice needs a clean selected reference clip; keep short/noisy speech unknown or choose an existing profile")
     manifest = ManifestStore(Path(review_dir) / "transcription_manifest.json")
     entry = manifest.get(packet["source_key"])
     if not entry or entry.get("source_fingerprint") != packet["fingerprint"]:
         raise SpeakerRegistryError("review has no matching processing manifest entry")
     outputs = {key: Path(value) for key, value in entry["outputs"].items()}
-    transaction = StateTransaction(Path(review_dir), [registry.path, manifest.path, path,
-                                                     path.with_suffix(".html"), *outputs.values()])
+    packets = list((Path(review_dir) / "speaker-reviews").glob("*.json"))
+    other_outputs = [Path(value) for record in manifest.data["sources"].values() for value in record.get("outputs", {}).values()]
+    transaction = StateTransaction(Path(review_dir), [registry.path, manifest.path, *packets,
+                                                     *(item.with_suffix(".html") for item in packets), *other_outputs])
     transaction.begin()
     try:
-        created = registry.confirm_references(references, new_profiles, receipt,
-                                               replace_source_fingerprint=packet["fingerprint"]["sha256"])
+        application_id = stable_hash([packet["review_id"], receipt, len(packet.get("receipts", []))])
+        created = registry.confirm_references(references, new_profiles, application_id,
+                                               replace_source_fingerprint=packet["fingerprint"]["sha256"],
+                                               profile_updates=combined["profile_updates"])
+        packet.setdefault("new_profile_ids", {}).update(created)
         for turn in turns:
             turn["review_choice"] = created.get(turn["review_choice"], turn["review_choice"])
         for key in ("assignments", "turn_overrides"):
@@ -320,6 +374,20 @@ def apply_review(review_dir, decision_path):
         for item in combined["range_overrides"]:
             item["profile"] = created.get(item["profile"], item["profile"])
         result = copy.deepcopy(packet["payload"])
+        base = copy.deepcopy(packet["local_result"])
+        policy = result["processing"].get("settings", {})
+        matcher = VoiceRegistry(registry.path, reviewed=True, learn=False,
+                                known_voices=policy.get("known_voices", ()),
+                                match_threshold=policy.get("speaker_match_threshold", .45),
+                                match_margin=policy.get("speaker_match_margin", .12))
+        labels = {str(turn.get("local_speaker") or turn["speaker"]) for turn in turns}
+        report = matcher.identify(source_key=packet["source_key"], source_fingerprint=packet["fingerprint"]["sha256"],
+                                  local_speakers=labels, evidence=packet["evidence"],
+                                  incompatible_pairs=overlapping_speaker_pairs(base.get("speaker_timeline", []))) if profiles or created else result["speaker_identity"]
+        apply_speaker_identities(base, report)
+        for key in ("segments", "speaker_timeline", "speaker_assignment_timeline", "speaker_identity"):
+            if key in base:
+                result[key] = base[key]
         segments = result["segments"]
         # Apply against original local labels, preserving the recognized words.
         apply_turn_choices(result, turns, packet["review_id"], receipt)
@@ -349,6 +417,7 @@ def apply_review(review_dir, decision_path):
         result["speaker_profiles"] = [profile for profile in registry.profiles_for_review() if profile["voice_id"] in active_ids]
         packet["payload"] = result
         packet["profiles"] = registry.profiles_for_review()
+        packet["matches"] = result["speaker_identity"]["matches"]
         write_outputs(outputs, result)
         manifest.record_speaker_registry({"path": str(registry.path), **registry.validate()})
         entry["human_review"] = {"review_id": packet["review_id"], "pending": pending, "receipt": receipt}
@@ -359,12 +428,37 @@ def apply_review(review_dir, decision_path):
         manifest.update(packet["source_key"], entry)
         atomic_write_json(path, packet)
         render_review(path, packet)
+        # Label changes describe the same durable person in every transcript.
+        if combined["profile_updates"]:
+            _sync_profile_labels(manifest, packet["profiles"], registry.validate(), path)
         transaction.commit()
     except BaseException:
         transaction.rollback()
         raise
     review_index(review_dir)
-    return {"created_profiles": created, "pending": len(pending), "outputs": {key: str(value) for key, value in outputs.items()}}
+    return {"created_profiles": created, "pending": len(pending), "references_saved": len(references),
+            "profiles_needing_audio": [profile["voice_id"] for profile in packet["profiles"] if profile["training_status"] != "ready"],
+            "outputs": {key: str(value) for key, value in outputs.items()}}
+
+
+def _sync_profile_labels(manifest, catalog, summary, current_path):
+    for entry in manifest.data["sources"].values():
+        files = {key: Path(value) for key, value in entry.get("outputs", {}).items()}
+        if "json" not in files or not files["json"].exists():
+            continue
+        payload = json.loads(files["json"].read_text(encoding="utf-8"))
+        active = {turn["speaker"] for turn in payload.get("turns", [])}
+        payload["speaker_profiles"] = [item for item in catalog if item["voice_id"] in active]
+        payload.setdefault("speaker_identity", {}).update(profile_count=summary["profile_count"],
+            registry_revision=summary["revision"], registry_state_hash=summary["state_hash"])
+        write_outputs(files, payload)
+    for path in current_path.parent.glob("*.json"):
+        packet = json.loads(path.read_text(encoding="utf-8"))
+        packet["profiles"] = catalog
+        active = {turn["speaker"] for turn in packet["payload"].get("turns", [])}
+        packet["payload"]["speaker_profiles"] = [item for item in catalog if item["voice_id"] in active]
+        atomic_write_json(path, packet)
+        render_review(path, packet)
 
 
 def merge_project_profiles(review_dir, duplicate, canonical):
@@ -403,7 +497,7 @@ def merge_project_profiles(review_dir, duplicate, canonical):
         for path in packets:
             packet = json.loads(path.read_text(encoding="utf-8"))
             # Source-bound acoustic evidence stays immutable.
-            for key in ("payload", "matches", "applied_decisions"):
+            for key in ("payload", "matches", "applied_decisions", "new_profile_ids"):
                 if key in packet:
                     packet[key] = relabel(packet[key])
             packet["profiles"] = registry.profiles_for_review()
@@ -483,41 +577,3 @@ def refresh_reviews(review_dir):
             raise
         refreshed.append({"source": packet["source_key"], "pending": len(pending)})
     return {"recordings": refreshed, "review_index": str(review_index(review_dir))}
-
-
-_REVIEW_HTML = r'''<!doctype html><html lang="en"><meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1"><title>Review speakers</title>
-<style>body{font:16px system-ui;max-width:1100px;margin:auto;padding:24px;background:#f4f6f9;color:#172235}header{position:sticky;top:0;background:#f4f6f9;padding:12px 0;z-index:2}audio{width:100%}section{background:white;border:1px solid #ccd4df;padding:20px;margin:16px 0;border-radius:10px}select,button,input{padding:8px;margin:4px;font:inherit}button{cursor:pointer}h1{font-size:26px}small{color:#46556c}.turn{border-top:1px solid #dde3ec;padding:12px 0}.pending{color:#963b10}.samples{display:flex;flex-wrap:wrap;gap:8px}.sample{padding:10px;background:#eef2f7}#message{font-weight:bold}</style>
-<header><h1 id="title"></h1><audio id="audio" controls preload="metadata" src="__AUDIO__"></audio>
-<button id="save">Export decisions</button><span id="message" role="status"></span></header>
-<p>Listen to several clips from each voice across the recording. Confirm the whole group only if it is one person. Use individual turn overrides for mixed adult/child groups. Uncheck unsuitable reference clips. Unknown is a valid answer.</p>
-<p>Candidate scores are cosine similarities, <strong>not probabilities</strong>. New identities require a selected clean reference clip. Child/adult roles are supplied by you; the software does not infer age from pitch.</p>
-<label>New profile label <input id="name" maxlength="80"></label><select id="role"><option value="unspecified">Unspecified</option><option value="adult">Adult</option><option value="child">Child</option></select><button id="add">Add choice</button>
-<main id="cards"></main><script>
-const data=__REVIEW_DATA__;
-const newProfiles={'new:Adult A':{label:'Adult A',role:'adult'},'new:Adult B':{label:'Adult B',role:'adult'},'new:Child':{label:'Child',role:'child'}};
-const byId=id=>document.getElementById(id); let stopAt=null;
-byId('title').textContent='Speaker review: '+data.source;
-function options(select, inherit){let value=select.value;select.replaceChildren();
- let o=new Option(inherit?'Use group decision':'Leave unchanged / review later','');select.add(o);
- select.add(new Option('Unknown / unresolved','unknown'));
- for(const p of data.profiles)select.add(new Option(p.voice_id+' — '+p.label+' ('+p.verified_sessions+' verified sessions)',p.voice_id));
- for(const [key,p] of Object.entries(newProfiles))select.add(new Option('Create '+p.label+' ('+p.role+')',key));select.value=value;}
-function time(t){return new Date(t*1000).toISOString().slice(11,23)}
-function play(start,end){byId('audio').currentTime=Math.max(0,start);stopAt=end;byId('audio').play().catch(()=>{byId('message').textContent='Audio unavailable. Keep the WAV beside this HTML file.'})}
-byId('audio').addEventListener('timeupdate',()=>{if(stopAt!==null&&byId('audio').currentTime>=stopAt){byId('audio').pause();stopAt=null}});
-function button(text,start,end){let b=document.createElement('button');b.textContent=text;b.onclick=()=>play(start,end);return b}
-const localIds=[...new Set(data.turns.map(t=>t.local_speaker||t.speaker))];
-for(const local of localIds){const section=document.createElement('section');let h=document.createElement('h2');h.textContent=local+(data.pending.includes(local)?' — needs review':' — automatically matched');section.append(h);
- const match=data.matches.find(m=>m.local_speaker===local);let scores=document.createElement('p');scores.textContent=(data.mixed.includes(local)?'Inconsistent voice evidence: inspect and split this group. ':'')+'Candidates: '+((match?.candidates||[]).map(c=>c.speaker+' similarity '+c.similarity.toFixed(3)).join(' · ')||'No existing reference profiles');section.append(scores);
- let select=document.createElement('select');select.dataset.local=local;options(select,false);section.append(select);
- let samples=document.createElement('div');samples.className='samples';
- (data.windows[local]||[]).forEach((w,i)=>{let item=document.createElement('label');item.className='sample';let check=document.createElement('input');check.type='checkbox';check.checked=!!w.reference_eligible&&w.retained!==false;check.disabled=!w.reference_eligible;check.dataset.window=local+':'+i;item.append(check,document.createTextNode('Reference '+(i+1)+(w.retained===false?' (different voice?) ':' ')),button(time(w.start)+'–'+time(w.end),w.start,w.end));samples.append(item)});section.append(samples);
- let details=document.createElement('details');let summary=document.createElement('summary');summary.textContent='Inspect all turns / override individual speakers';details.append(summary);
- for(const t of data.turns.filter(t=>(t.local_speaker||t.speaker)===local)){let row=document.createElement('div');row.className='turn';row.append(button(time(t.start)+'–'+time(t.end),t.start,t.end));let text=document.createElement('p');text.textContent=t.text;row.append(text);let choice=document.createElement('select');choice.dataset.turn=t.id;options(choice,true);row.append(choice);for(const key of ['start','end']){let label=document.createElement('label');label.textContent=key+' seconds ';let input=document.createElement('input');input.type='number';input.step='0.001';input.min=t.start;input.max=t.end;input.value=t[key];input.dataset[key]=t.id;label.append(input);row.append(label)}let note=document.createElement('small');note.textContent=' Narrow the time range to correct part of a turn. Words are assigned by their aligned midpoint.';row.append(note);details.append(row)}section.append(details);byId('cards').append(section)}
-byId('add').onclick=()=>{const label=byId('name').value.trim();if(!label)return;newProfiles['new:'+label]={label,role:byId('role').value};document.querySelectorAll('select[data-local],select[data-turn]').forEach(s=>options(s,!!s.dataset.turn));byId('name').value=''};
-byId('save').onclick=()=>{const assignments={},turn_overrides={},range_overrides=[],exclude_windows=[];
- document.querySelectorAll('select[data-local]').forEach(s=>{if(s.value)assignments[s.dataset.local]=s.value});document.querySelectorAll('select[data-turn]').forEach(s=>{if(s.value){const t=data.turns.find(t=>t.id===s.dataset.turn),start=Number(document.querySelector('input[data-start="'+t.id+'"]').value),end=Number(document.querySelector('input[data-end="'+t.id+'"]').value);if(start===t.start&&end===t.end)turn_overrides[t.id]=s.value;else range_overrides.push({turn_id:t.id,start,end,profile:s.value})}});document.querySelectorAll('input[data-window]').forEach(s=>{if(!s.checked)exclude_windows.push(s.dataset.window)});
- if(!Object.keys(assignments).length&&!Object.keys(turn_overrides).length&&!range_overrides.length){byId('message').textContent='Choose at least one group or turn.';return}
- const result={review_id:data.review_id,packet:data.packet,assignments,turn_overrides,range_overrides,new_profiles:newProfiles,exclude_windows};const url=URL.createObjectURL(new Blob([JSON.stringify(result,null,2)],{type:'application/json'}));const a=document.createElement('a');a.href=url;a.download=data.packet.replace('.json','.decisions.json');a.click();setTimeout(()=>URL.revokeObjectURL(url),1000);byId('message').textContent='Apply the downloaded file with: ./transcribe-media --apply-speaker-review /path/to/decisions.json';};
-</script></html>'''

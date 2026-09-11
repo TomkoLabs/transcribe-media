@@ -4,7 +4,7 @@ Use Python 3.11 on Linux. The standard installer supplies the full environment;
 run the checks with:
 
 ```bash
-sudo apt-get install -y shellcheck
+sudo apt-get install -y shellcheck nodejs
 ./scripts/check.sh
 ```
 
@@ -17,10 +17,15 @@ python -m pip install -r requirements-test.txt
 TRANSCRIBE_TEST_PYTHON=python ./scripts/check.sh
 ```
 
-The OS also needs FFmpeg and ShellCheck. Tests use temporary directories,
+The OS also needs FFmpeg, ShellCheck and Node.js 18 or newer. Node is used only
+for review-state tests; normal installation and transcription do not need it.
+Tests use temporary directories,
 synthetic audio/embeddings and mocked model interfaces. They exercise CLI
 processing, first enrollment, speaker correction/merge/rematch, incremental
 reruns, cache integrity, state recovery, CUDA selection, and installer failures.
+The offline UI embeds `review_state.js` and `review_page.html` from the Python
+package. Run `node tests/test_review_state.cjs` for draft/import/clip-range tests.
+Use synthetic recordings for browser checks of filters, playback, labels and export.
 The GitHub Actions workflow runs the same checks in Debian 12 and 13 containers.
 GitLab CI is retained for the existing mirror.
 
@@ -66,7 +71,7 @@ protects the default paths; custom output paths must be handled separately.
 Do not blindly add unrelated local notes to the release.
 
 Push the reviewed commit to the chosen GitHub repository and verify the **CI**
-workflow passes. Create an annotated `v1.12.0` tag on that exact commit and publish
+workflow passes. Create an annotated version tag on that exact commit and publish
 release notes from the changelog, stating any hardware validation still pending.
 Use GitHub's source archives; do not archive the working directory containing
 private media. Release publication is a maintainer action, not part of running

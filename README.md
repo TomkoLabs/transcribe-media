@@ -81,21 +81,26 @@ skipped; files awaiting human review do not repeatedly rerun transcription.
 Open **`Review/speaker-reviews/index.html`** in your own browser, then open a
 recording's review page. No web server is required.
 
-- Listen to several reference clips for each local speaker group. The page shows
-  timestamps, transcript turns, likely existing profiles and similarity scores.
-- On the first recording, choose **Create Adult A**, **Create Adult B**, and
-  **Create Child** if applicable. On later recordings, choose the existing
-  person's `VOICE_…` ID. Avoid creating another profile for the same person.
-- Uncheck unsuitable reference clips. If a group contains two people, expand its
-  turns and correct those turns or time ranges before accepting the references.
-- Click **Export decisions**, then apply the downloaded JSON:
+- Start in **Needs attention**. Confident matches are already selected under
+  **Already assigned**; uncertain groups have no person selected.
+- Listen to several clearly separated clip cards, each with its own timestamp,
+  transcript excerpt and current person. Assign the whole group to **Adult A**,
+  **Adult B**, **Child**, or an existing person. Use **People & profile labels**
+  to name people. Reuse the same profile across recordings.
+- Use **Change only this clip** or expand **All soundbites** to correct exceptions.
+  Uncheck noisy, overlapping or wrongly attributed training clips. Speaker labels
+  can be saved even when no clip is suitable for training.
+- Click **Export review**, then **Copy apply command**. Run the copied command in
+  your project terminal (adjust the downloads path if needed):
 
 ```bash
 ./transcribe-media --apply-speaker-review "$HOME/Downloads/REPLACE_WITH_EXPORTED_FILENAME.decisions.json"
 ```
 
-Use the actual exported filename. The command saves the verified profiles and
-updates that recording's transcript immediately, without rerunning ASR. If you
+Use the actual exported filename. **Import saved review** resumes an exported
+draft; the browser also keeps a local draft when storage is available. Exporting
+alone does not change the transcript. Applying saves the speaker labels and
+approved references immediately, without rerunning ASR. If you
 already processed other recordings, apply the improved profiles to them with:
 
 ```bash
@@ -110,6 +115,23 @@ the same clip. Scores are **similarities, not calibrated probabilities**.
 Unresolved voices stay marked **`DRAFT: SPEAKER REVIEW REQUIRED`**. An occasional
 child is allowed as a third speaker, but age is not inferred automatically.
 Human review of speaker identity does not certify every recognized word.
+
+### Updating the review page
+
+For an existing installation, update the source and regenerate the pages:
+
+```bash
+git pull --ff-only
+./transcribe-media --review-speakers
+```
+
+No reinstall or retranscription is needed for this review update. Reopen the HTML
+page after regenerating it. You can retry an existing failed decisions file with
+`--apply-speaker-review`; short or missing reference audio no longer blocks saving
+the chosen people. The original recording and speaker boundaries must still match.
+Profiles show **untrained**, **collecting**, or **ready** separately from their
+transcript labels. See [the quality guide](QUALITY_GUIDE.md) for short-clip learning,
+profile edits and restoring saved reviews.
 
 ## Defaults and the few useful options
 
@@ -159,7 +181,8 @@ Review application validates the original source, so keep its location/content
 unchanged while reviewing. Review audio adds approximately 115 MB per hour.
 Keep each review HTML beside its WAV if copying the review folder to a desktop.
 
-Updates use `git pull --ff-only` followed by `./install.sh`. Ignored recordings
+Updates use `git pull --ff-only`; rerun `./install.sh` when dependency or model
+requirements change. The 1.13 review update needs no reinstall. Ignored recordings
 and voice state are preserved. Program/model changes can require reprocessing;
 back up first. Versions before 1.12 required `--quality`; it is now automatic.
 Old automatic profiles remain candidates but need human-reviewed reference clips
