@@ -41,7 +41,7 @@
       const choices = Object.hasOwn(input,'new_profiles') ? draft.new_profiles : {...this.defaults};
       const check = choice => {
         choice = resolve(choice);
-        if (typeof choice !== 'string' || !choice || (choice !== 'unknown' && !this.catalog.has(choice) && !choices[choice]))
+        if (typeof choice !== 'string' || !choice || (!['unknown','ignore'].includes(choice) && !this.catalog.has(choice) && !choices[choice]))
           throw Error('Unknown profile choice. Regenerate the review page to load current profiles.');
         return choice;
       };
@@ -118,6 +118,7 @@
     label(choice) {
       if(!choice) return 'Not assigned';
       if(choice==='unknown') return 'Unknown / review later';
+      if(choice==='ignore') return 'UNKNOWN · excluded from voice learning';
       return this.newProfiles[choice]?.label || this.updates[choice]?.label || this.catalog.get(choice)?.label || choice;
     }
     status(local) {
@@ -127,12 +128,77 @@
       if(this.assignments[local] || turns.some(t=>this.overrides[t.id] || this.ranges.some(r=>r.turn_id===t.id))) return 'reviewed';
       return this.machine[local] ? 'matched' : 'pending';
     }
+    needsAttention(local) {
+      if(this.status(local)==='pending')return true;
+      if(this.assignments[local])return false;
+      return this.data.turns.some(t=>(t.local_speaker||t.speaker)===local &&
+        t.speaker_attribution?.status==='uncertain' && !this.overrides[t.id] &&
+        this.ranges.filter(r=>r.turn_id===t.id).reduce((sum,r)=>sum+r.end-r.start,0)<t.end-t.start-1e-6);
+    }
     export() {
       return {format_version:2, review_id:this.data.review_id, packet:this.data.packet,
         assignments:copy(this.assignments),turn_overrides:copy(this.overrides),range_overrides:copy(this.ranges),
         new_profiles:copy(this.newProfiles),profile_updates:copy(this.updates),exclude_windows:[...this.excluded].sort()};
     }
   }
+  class ReviewWorkspace {
+    constructor(input) {
+      this.input=input;
+      this.batch=input.kind==='speaker_review_batch';
+      this.records=this.batch?input.recordings:[input];
+      const aliases={...(input.new_profile_ids||{})},conflicts=new Set();
+      for(const record of this.records)for(const [key,value] of Object.entries(record.new_profile_ids||{})){
+        if(aliases[key]&&aliases[key]!==value)conflicts.add(key);else aliases[key]=value;
+      }
+      for(const key of conflicts)delete aliases[key];
+      this.drafts=this.records.map(record=>new ReviewDraft({...record,
+        new_profile_ids:{...aliases,...(record.new_profile_ids||{})}}));
+      this.current=0;
+      if(this.batch){
+        const defaults={};
+        for(const [label,role] of [['Adult A','adult'],['Adult B','adult'],['Child','child']]){
+          if(!input.profiles.some(p=>p.label===label)) defaults['new:batch:'+input.batch_id.slice(0,12)+':'+label]={label,role};
+        }
+        this.drafts[0].newProfiles=defaults;
+      }
+      this.synchronize(this.drafts[0]);
+    }
+    synchronize(draft) {
+      this.newProfiles=draft.newProfiles;this.updates=draft.updates;
+      for(const item of this.drafts){item.newProfiles=this.newProfiles;item.updates=this.updates;}
+    }
+    removePerson(key){for(const draft of this.drafts)draft.removeDraft(key);this.synchronize(this.drafts[this.current]);}
+    newKey(){let n=1;const prefix=this.batch?'new:batch:'+this.input.batch_id.slice(0,12)+':person-':'new:person-';
+      while(this.newProfiles[prefix+n] || this.drafts.some(d=>(d.data.new_profile_ids||{})[prefix+n]))n++;return prefix+n;}
+    export(){
+      if(!this.batch)return this.drafts[0].export();
+      return {kind:'speaker_review_batch',format_version:3,batch_id:this.input.batch_id,
+        new_profiles:copy(this.newProfiles),profile_updates:copy(this.updates),
+        reviews:this.drafts.map(d=>({...d.export(),new_profiles:{},profile_updates:{}}))};
+    }
+    load(input){
+      // Validate into temporary drafts so one bad recording cannot partially import.
+      const isBatch=object(input)&&input.kind==='speaker_review_batch';
+      if(isBatch && (input.format_version!==3 || !Array.isArray(input.reviews) || !input.reviews.length))throw Error('Invalid batch review file.');
+      const entries=isBatch?input.reviews:[input];
+      if(entries.some(e=>!object(e)) || new Set(entries.map(e=>e.packet)).size!==entries.length)throw Error('Invalid or duplicate recordings in review file.');
+      const incoming=new Map(entries.map(e=>[e.packet,e]));
+      if([...incoming.keys()].some(key=>!this.records.some(r=>r.packet===key)))throw Error('This file includes recordings absent from this review page. Regenerate the index.');
+      const complete=isBatch&&entries.length===this.records.length;
+      const definitions=Object.hasOwn(input,'new_profiles')?input.new_profiles:{};
+      const edits=Object.hasOwn(input,'profile_updates')?input.profile_updates:{};
+      if(!object(definitions)||!object(edits))throw Error('Invalid shared profiles.');
+      const newProfiles={...(complete?{}:this.newProfiles),...definitions};
+      const updates={...(complete?{}:this.updates),...edits};
+      const next=this.drafts.map(previous=>{
+        const candidate=new ReviewDraft(previous.data);
+        const entry=incoming.get(previous.data.packet)||previous.export();
+        candidate.load({...entry,new_profiles:newProfiles,profile_updates:updates});return candidate;
+      });
+      this.drafts=next;this.synchronize(next[this.current]);
+    }
+  }
   root.ReviewDraft=ReviewDraft;
-  if(typeof module!=='undefined') module.exports={ReviewDraft};
+  root.ReviewWorkspace=ReviewWorkspace;
+  if(typeof module!=='undefined') module.exports={ReviewDraft,ReviewWorkspace};
 })(globalThis);

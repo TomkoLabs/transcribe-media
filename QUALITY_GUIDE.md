@@ -42,10 +42,11 @@ An exact count should be supplied only when known for every file in the batch.
 
 ## Confirm initial profiles
 
-Open `Review/speaker-reviews/index.html` in your own browser. Each recording has
-a page with local playback, clean reference clips, timestamps, all transcribed
-turns, and candidate VOICE IDs. There are no external scripts or hosted services.
-The page uses a sibling WAV, so keep the HTML and WAV together. On a headless GX10,
+Open `Review/speaker-reviews/index.html` in your own browser. This aggregates all
+recordings with shared people, a recording selector, progress counts, local
+playback, reference clips, timestamps, all turns and candidate VOICE IDs. Individual
+recording HTML files remain available. There are no external scripts or services.
+The pages use sibling WAVs, so keep the review folder together. On a headless GX10,
 copy this review folder to your desktop for listening, then apply the exported
 decisions on the machine holding the original project and recordings.
 
@@ -65,20 +66,25 @@ decisions on the machine holding the original project and recordings.
    An acoustic outlier or model-disputed clip is initially unchecked but can be explicitly selected
    after assigning it to its actual speaker. A window spanning different
    reviewed identities is excluded from reference training.
-5. Click **Export review**, then **Copy apply command**, and run the copied command
-   in the project terminal. Refresh other recordings if already processed:
+5. Click **Save to project** and select the project folder. Supported browsers
+   write into `speaker-decisions/`. Alternatively, **Download JSON** and move the
+   file there yourself. Click **Copy apply command** and run it from the project:
 
 ```bash
-./transcribe-media --apply-speaker-review /path/to/downloaded.decisions.json
-./transcribe-media --refresh-voices
-./transcribe-media --review-speakers
+./transcribe-media --apply-speaker-review "speaker-decisions/batch-REPLACE_WITH_EXPORTED_ID.decisions.json"
 ```
 
 Applying a review assigns durable IDs, stores the selected references as
 human-verified evidence, and immediately regenerates TXT, JSON and requested
 subtitles. It does not rerun ASR or change recognized words. Refresh rematches
 cached recordings using verified references, preserving existing human choices.
-Strong matches are applied automatically; unresolved matches stay in the queue.
+An aggregated export applies all explicit reviews and then refreshes every cached
+recording, using the final shared references. No separate `--refresh-voices` is
+needed. A single-recording export updates that recording; use `--refresh-voices`
+afterward to propagate improved profiles. Strong matches are applied automatically;
+unresolved matches stay in the queue. There is no automatic equivalence between
+the same local SPEAKER number in different recordings. Choose the same shared
+person only after listening; processing order need not determine enrollment.
 Refresh and review application leave old per-turn tone/acoustic estimates out
 when rebuilding turns; a normal processing run recomputes them.
 
@@ -95,6 +101,18 @@ automatically later. Profiles display **untrained** (no verified clips),
 **collecting** (some clips, insufficient support), or **ready** (a reference
 condition meets the support rules). Ready is not an accuracy guarantee.
 
+TXT turns and subtitles display the person's label with the stable ID, for example
+`Adult A [VOICE_0001]`. JSON retains the canonical ID and profile catalog. Filenames
+stay tied to their source recording. `SPEAKER_01` is a local detection label; a
+confirmed person receives a durable `VOICE_…` ID.
+
+**Unknown / review later** excludes a passage from training and leaves it pending.
+**UNKNOWN — exclude from voice learning** also excludes training, preserves the
+words under `UNKNOWN`, and records a completed human decision without repeatedly
+queuing it for identity review. Both survive refresh. This is an abstention about
+identity, not proof that the voice belongs to someone outside your named profiles.
+To keep a known person's label but skip training, simply uncheck the reference clip.
+
 Automatic matching needs either two verified clips of at least 2.5 seconds, or
 at least five consistent clips of 0.8–under 2.5 seconds totaling at least eight
 seconds, **from the same recording**. The short-clip route compares every clip
@@ -109,9 +127,18 @@ as a reference. Nonverbal vocalizations are not guaranteed to be transcribed.
 applied. It checks the recording and validates all choices before changing the
 page. A local browser draft is also saved when browser storage is available;
 export is the portable backup. **Reset draft** restores the last applied review.
-The page stays fully offline: export/import cannot directly write transcript or
+In the aggregated page, reset covers the whole batch. Import validates every
+included recording before changing any draft. Older single-recording files can
+be imported into the batch page; other recordings keep their choices.
+The page stays fully offline: saving/importing decisions cannot directly write transcript or
 registry files. Applying through the copied command keeps the workflow to one
 HTML page and one command, without installing or securing a local web service.
+Folder saving requires the browser's File System Access API and your explicit
+folder selection; unsupported browsers use the download-and-move fallback.
+The copied command always uses `speaker-decisions/` relative to the project root.
+The script also resolves that folder against its installed project when invoked
+from another working directory. No Downloads location is assumed.
+[Browser folder access](https://developer.mozilla.org/en-US/docs/Web/API/Window/showDirectoryPicker)
 
 **People & profile labels** lets you add people, edit labels and adult/child roles,
 remove unused draft people, and archive existing profiles. Removing a draft person

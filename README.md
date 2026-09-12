@@ -76,45 +76,62 @@ path to **`Review/speaker-reviews/index.html`**. Processing is incremental: add
 more recordings and run the same command again. Completed, unchanged files are
 skipped; files awaiting human review do not repeatedly rerun transcription.
 
-### 4. Confirm the initial voices
+### 4. Review the whole batch, then apply once
 
-Open **`Review/speaker-reviews/index.html`** in your own browser, then open a
-recording's review page. No web server is required.
+You can put all your videos in `Video Source/` and process them together, even
+before any voice profiles exist. Open **`Review/speaker-reviews/index.html`** in
+your browser when processing finishes. It is one review page for all recordings;
+no web server is required and you do not need to choose a best first recording.
 
-- Start in **Needs attention**. Confident matches are already selected under
-  **Already assigned**; uncertain groups have no person selected.
-- Listen to several clearly separated clip cards, each with its own timestamp,
-  transcript excerpt and current person. Assign the whole group to **Adult A**,
-  **Adult B**, **Child**, or an existing person. Use **People & profile labels**
-  to name people. Reuse the same profile across recordings.
-- Use **Change only this clip** or expand **All soundbites** to correct exceptions.
-  Uncheck noisy, overlapping or wrongly attributed training clips. Speaker labels
-  can be saved even when no clip is suitable for training.
-- Click **Export review**, then **Copy apply command**. Run the copied command in
-  your project terminal (adjust the downloads path if needed):
+- Use **Recording** or **Next needing attention** to move through the batch.
+  Confident matches are already selected; uncertain groups have no person selected.
+- Listen to several clips, then assign **Adult A**, **Adult B**, **Child**, or an
+  existing person. **People & profile labels** is shared across the whole batch.
+  Local speaker numbers can refer to different people in different recordings.
+- Use **Change only this clip** or **All soundbites** to correct exceptions.
+  Uncheck unsuitable training clips. Choose **UNKNOWN — exclude from voice
+  learning** to keep a passage anonymous and exclude it from training, or
+  **Unknown / review later** if it still needs attention.
+- Click **Save to project** and select the project folder containing
+  `transcribe-media`. The page creates/saves its JSON in **`speaker-decisions/`**.
+  The browser remembers the selected folder during the page session. If folder
+  saving is unavailable, use **Download JSON** and move the file into
+  `speaker-decisions/` yourself; a web page cannot discover your download path.
+- Click **Copy apply command** and run it from the project folder. It will look like:
 
 ```bash
-./transcribe-media --apply-speaker-review "$HOME/Downloads/REPLACE_WITH_EXPORTED_FILENAME.decisions.json"
+./transcribe-media --apply-speaker-review "speaker-decisions/batch-REPLACE_WITH_EXPORTED_ID.decisions.json"
 ```
 
-Use the actual exported filename. **Import saved review** resumes an exported
-draft; the browser also keeps a local draft when storage is available. Exporting
-alone does not change the transcript. Applying saves the speaker labels and
-approved references immediately, without rerunning ASR. If you
-already processed other recordings, apply the improved profiles to them with:
+Use the actual filename from the copied command. **One batch apply saves all
+manual corrections and reviewed references, then rematches all cached recordings
+with the final profiles.** No separate refresh command is needed for a batch
+export. Unreviewed recordings can gain confident matches; remaining uncertainty
+stays visible when you reopen the page. Manually confirmed choices always win.
+
+**Import saved review** resumes an exported batch or imports a single recording's
+older decisions. The browser also keeps a local draft when storage is available.
+Saving a JSON alone does not change transcripts. A batch failure rolls back the
+whole update, so a stale recording cannot leave half the batch applied.
+
+Readable turns show names and durable IDs, for example **`Adult A [VOICE_0001]:`**.
+JSON keeps the stable ID and profile metadata. Transcript filenames do not change.
+Unresolved voices keep the transcript marked **`DRAFT: SPEAKER REVIEW REQUIRED`**;
+explicitly excluded UNKNOWN passages remain in the text without requiring further
+identity review. UNKNOWN does not prove that a different person spoke.
+
+For later profile improvements outside a batch apply, use:
 
 ```bash
 ./transcribe-media --refresh-voices
 ```
 
-Reopen the review index for remaining uncertain voices. New recordings use the
-verified profiles automatically. The first recordings need more review; coverage
-across microphones, rooms and sessions matters more than repeatedly confirming
-the same clip. Scores are **similarities, not calibrated probabilities**.
-
-Unresolved voices stay marked **`DRAFT: SPEAKER REVIEW REQUIRED`**. An occasional
-child is allowed as a third speaker, but age is not inferred automatically.
-Human review of speaker identity does not certify every recognized word.
+This rematches saved speaker evidence and rewrites speaker assignments without
+rerunning speech recognition or changing the recognized wording. Clean reviewed
+clips from different rooms, microphones and sessions improve reference coverage;
+processing everything first does not remove the need for good references.
+Scores are **similarities, not calibrated probabilities**. Human speaker review
+does not certify every recognized word, and adult/child roles are supplied by you.
 
 ### Updating the review page
 
@@ -168,13 +185,14 @@ in [QUALITY_GUIDE.md](QUALITY_GUIDE.md).
 | `Video Source/` | Your original media; never modified by processing |
 | `Transcribed/` | Readable TXT transcripts with speaker turns and uncertainty |
 | `Review/` | Detailed JSON, manifest, persistent voice registry, ASR cache and review pages/audio |
+| `speaker-decisions/` | Private exported review decisions; ignored by Git |
 
 JSON is always generated; add `--review-formats json,srt,vtt` for subtitles.
 Default paths belong to the checkout, even when invoking the installed
 `transcribe-media` command from another directory. Passing another source folder
 alone still uses this checkout's output directories and voice registry.
 
-**Back up `Review/` together with the original recordings and `Transcribed/`.**
+**Back up `Review/`, `speaker-decisions/`, original recordings and `Transcribed/`.**
 The registry, manifest and review packets belong together. Do not delete just the
 registry to fix duplicate people; use the merge workflow in the quality guide.
 Review application validates the original source, so keep its location/content
@@ -182,7 +200,7 @@ unchanged while reviewing. Review audio adds approximately 115 MB per hour.
 Keep each review HTML beside its WAV if copying the review folder to a desktop.
 
 Updates use `git pull --ff-only`; rerun `./install.sh` when dependency or model
-requirements change. The 1.13 review update needs no reinstall. Ignored recordings
+requirements change. The 1.14 review update needs no reinstall. Ignored recordings
 and voice state are preserved. Program/model changes can require reprocessing;
 back up first. Versions before 1.12 required `--quality`; it is now automatic.
 Old automatic profiles remain candidates but need human-reviewed reference clips

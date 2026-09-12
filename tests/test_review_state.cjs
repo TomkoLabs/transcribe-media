@@ -2,7 +2,8 @@ const {test}=require('node:test');
 const assert=require('node:assert/strict');
 const fs=require('node:fs');
 const vm=require('node:vm');
-const {ReviewDraft}=require('../transcribe_media_app/review_state.js');
+const {ReviewDraft,ReviewWorkspace}=require('../transcribe_media_app/review_state.js');
+const ReviewIO=require('../transcribe_media_app/review_io.js');
 const make=()=>({review_id:'review-1',packet:'packet.json',source:'synthetic.wav',
   profiles:[{voice_id:'VOICE_0001',label:'Alex',role:'adult',verified_sessions:2}],
   matches:[{local_speaker:'A',speaker:'VOICE_0001',status:'matched',similarity:.92},
@@ -55,4 +56,72 @@ test('all inline review scripts parse without external dependencies',()=>{
   const html=fs.readFileSync('transcribe_media_app/review_page.html','utf8');
   for(const match of html.matchAll(/<script>([\s\S]*?)<\/script>/g)) new vm.Script(match[1]);
   assert.equal(/<script[^>]+src=/.test(html),false);
+});
+
+const makeBatch=()=>{const first=make(),second={...make(),review_id:'review-2',packet:'second.json',source:'second.wav'};
+  return {kind:'speaker_review_batch',batch_id:'batch-identity',profiles:first.profiles,recordings:[first,second]};};
+test('batch people and profile edits are shared but local assignments remain separate',()=>{
+  const w=new ReviewWorkspace(makeBatch()),key=w.newKey();
+  w.drafts[0].newProfiles[key]={label:'Shared person',role:'adult'};
+  w.drafts[0].assignments.B=key;w.drafts[0].updates.VOICE_0001={label:'Alex edited',role:'adult'};
+  w.synchronize(w.drafts[0]);
+  assert.equal(w.drafts[1].label(key),'Shared person');assert.equal(w.drafts[1].label('VOICE_0001'),'Alex edited');
+  assert.equal(w.drafts[1].groupChoice('B'),'');w.drafts[1].assignments.B=key;
+  const saved=w.export();assert.equal(saved.reviews.length,2);assert.equal(saved.new_profiles[key].label,'Shared person');
+  const restored=new ReviewWorkspace(makeBatch());restored.load(saved);assert.deepEqual(restored.export(),saved);
+});
+test('a malformed batch import changes no recording draft',()=>{
+  const w=new ReviewWorkspace(makeBatch());w.drafts[0].assignments.B='ignore';const before=w.export();
+  const bad=structuredClone(before);bad.reviews[1].review_id='other';
+  assert.throws(()=>w.load(bad));assert.deepEqual(w.export(),before);
+});
+test('removing a shared draft person clears their decisions in every recording',()=>{
+  const w=new ReviewWorkspace(makeBatch()),key=w.newKey();
+  w.newProfiles[key]={label:'A person',role:'adult'};for(const d of w.drafts)d.assignments.B=key;
+  w.removePerson(key);assert.ok(w.drafts.every(d=>d.groupChoice('B')==='unknown'));
+  const saved=w.export();w.load(saved);assert.equal(w.newProfiles[key],undefined);
+});
+test('old batch imports resolve previously created people in a regenerated page',()=>{
+  const input=makeBatch(),w=new ReviewWorkspace(input),key=w.newKey();
+  w.newProfiles[key]={label:'Alex',role:'adult'};w.drafts[0].assignments.B=key;
+  const saved=w.export();input.new_profile_ids={[key]:'VOICE_0001'};
+  const updated=new ReviewWorkspace(input);updated.load(saved);assert.equal(updated.drafts[0].groupChoice('B'),'VOICE_0001');
+});
+test('importing one recording leaves other recording decisions intact',()=>{
+  const w=new ReviewWorkspace(makeBatch());w.drafts[1].assignments.B='ignore';
+  w.load({...make(),format_version:2,assignments:{B:'VOICE_0001'}});
+  assert.equal(w.drafts[0].groupChoice('B'),'VOICE_0001');assert.equal(w.drafts[1].groupChoice('B'),'ignore');
+});
+test('a previously created single-recording draft person is reused throughout the batch',()=>{
+  const data=makeBatch();data.recordings[0].new_profile_ids={'new:Adult A':'VOICE_0001'};
+  const w=new ReviewWorkspace(data);
+  w.load({format_version:2,packet:'packet.json',review_id:'review-1',assignments:{B:'new:Adult A'},
+    new_profiles:{'new:Adult A':{label:'Adult A',role:'adult'}}});
+  assert.equal(w.drafts[0].groupChoice('B'),'VOICE_0001');
+  assert.equal(w.drafts[1].data.new_profile_ids['new:Adult A'],'VOICE_0001');
+});
+test('explicit unknown stays distinct from an unresolved review',()=>{
+  const d=new ReviewDraft(make());d.assignments.B='ignore';assert.equal(d.status('B'),'reviewed');
+  assert.match(d.label('ignore'),/UNKNOWN/);d.load(d.export());assert.equal(d.groupChoice('B'),'ignore');
+  d.assignments.B='unknown';assert.equal(d.status('B'),'pending');
+});
+test('batch navigation includes uncertain timing until the affected turn is reviewed',()=>{
+  const data=make();data.turns[0].speaker_attribution={status:'uncertain'};
+  const d=new ReviewDraft(data);assert.equal(d.status('A'),'matched');assert.equal(d.needsAttention('A'),true);
+  d.setRange('a',0,1,'ignore');assert.equal(d.needsAttention('A'),true);
+  d.setRange('a',1,6,'VOICE_0001');assert.equal(d.needsAttention('A'),false);
+});
+test('apply command uses only the project decisions folder',()=>{
+  assert.equal(ReviewIO.command('batch-123.decisions.json'),'./transcribe-media --apply-speaker-review "speaker-decisions/batch-123.decisions.json"');
+  assert.throws(()=>ReviewIO.command('../secret.decisions.json'));
+});
+test('folder saving validates the project and writes the exact relative destination',async()=>{
+  const calls=[];let content;
+  const writer={write:async value=>content=value,close:async()=>calls.push('close'),abort:async()=>calls.push('abort')};
+  const folder={getFileHandle:async(name,options)=>{calls.push([name,options]);return {createWritable:async()=>writer};}};
+  const project={getFileHandle:async name=>calls.push(name),getDirectoryHandle:async(name,options)=>{calls.push([name,options]);return folder;}};
+  const path=await ReviewIO.writeToProject(project,'batch-123.decisions.json',{example:true});
+  assert.equal(path,'speaker-decisions/batch-123.decisions.json');assert.deepEqual(JSON.parse(content),{example:true});
+  assert.deepEqual(calls,['transcribe-media',['transcribe_media_app',undefined],['speaker-decisions',{create:true}],['batch-123.decisions.json',{create:true}],'close']);
+  await assert.rejects(()=>ReviewIO.writeToProject({getFileHandle:async()=>{throw Error('Wrong folder');}},'batch-123.decisions.json',{}));
 });

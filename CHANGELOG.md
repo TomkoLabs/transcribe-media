@@ -1,5 +1,25 @@
 # Changelog
 
+## 1.14.0 — 2026-09-11
+
+- Aggregated offline review across all processed recordings, with one shared
+  person catalog, recording navigation, saved drafts and one batch decisions JSON.
+- Batch application creates shared profiles once, applies manual corrections,
+  then rematches all cached transcripts using the final references. The entire
+  update rolls back on failure, and repeated/revised imports preserve identity IDs.
+- Replaced the assumed Downloads path with project-relative `speaker-decisions/`.
+  Added optional browser folder saving, explicit download fallback instructions,
+  and useful errors for misplaced decision files.
+- Readable transcript turns and subtitles now show profile labels alongside
+  durable VOICE IDs. JSON IDs and source-based transcript filenames stay stable.
+- Added a confirmed UNKNOWN exclusion that preserves words without voice training
+  or repeated identity-review requests. The existing unresolved choice remains.
+
+No new models, inference hardware requirements, server or runtime dependencies.
+Regenerate existing pages with `--review-speakers`; batch apply includes the final
+cached voice refresh, without retranscription. Synthetic tests validate workflow
+and recovery, not measured identification accuracy or GX10 speed.
+
 ## 1.13.0 — 2026-09-11
 
 - Rebuilt offline speaker review with distinct clip cards, current identities,

@@ -23,9 +23,13 @@ Tests use temporary directories,
 synthetic audio/embeddings and mocked model interfaces. They exercise CLI
 processing, first enrollment, speaker correction/merge/rematch, incremental
 reruns, cache integrity, state recovery, CUDA selection, and installer failures.
-The offline UI embeds `review_state.js` and `review_page.html` from the Python
+The offline UI embeds `review_state.js`, `review_io.js` and `review_page.html` from the Python
 package. Run `node tests/test_review_state.cjs` for draft/import/clip-range tests.
 Use synthetic recordings for browser checks of filters, playback, labels and export.
+Batch tests cover shared enrollment, final rematching, UNKNOWN exclusions,
+alias recovery, relative decision paths and rollback of the whole batch. Browser
+folder-saving logic is tested with fake file handles; manually check the native
+folder picker in a supporting browser before claiming a specific browser is supported.
 The GitHub Actions workflow runs the same checks in Debian 12 and 13 containers.
 GitLab CI is retained for the existing mirror.
 

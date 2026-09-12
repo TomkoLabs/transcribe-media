@@ -333,6 +333,11 @@ class VoiceRegistry:
             mapping.update(data.get("applied_reviews", {}).get(receipt, {}))
         return {key: data.get("aliases", {}).get(value, value) for key, value in mapping.items()}
 
+    def resolve_profile_ids(self, mapping):
+        with self._locked():
+            data = self._load_unlocked()
+        return {key: data.get("aliases", {}).get(value, value) for key, value in mapping.items()}
+
     @staticmethod
     def _reference_conditions(profile):
         """Independent support from long clips or a consistent set of short clips.

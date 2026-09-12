@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import copy
-import html
 import json
 import math
 import os
@@ -53,9 +52,9 @@ def apply_turn_choices(result, turns, review_id, receipt=None):
             choice = choice_at(local, float(unit["start"]), float(unit["end"]))
             if choice is None:
                 continue
-            unit["speaker"] = "SPEAKER_UNKNOWN" if choice == "unknown" else choice
+            unit["speaker"] = "SPEAKER_UNKNOWN" if choice in ("unknown", "ignore") else choice
             unit["local_speaker"] = local
-            unit["speaker_identity"] = {"status": "unresolved_human" if choice == "unknown" else "human_verified",
+            unit["speaker_identity"] = {"status": "unresolved_human" if choice == "unknown" else "human_excluded" if choice == "ignore" else "human_verified",
                                          "review_id": review_id, "receipt": receipt}
     for name in ("speaker_timeline", "speaker_assignment_timeline"):
         pieces = []
@@ -68,7 +67,7 @@ def apply_turn_choices(result, turns, review_id, receipt=None):
                 choice = choice_at(local, first, last)
                 piece = {**interval, "start": first, "end": last, "local_speaker": local}
                 if choice is not None:
-                    piece["speaker"] = "SPEAKER_UNKNOWN" if choice == "unknown" else choice
+                    piece["speaker"] = "SPEAKER_UNKNOWN" if choice in ("unknown", "ignore") else choice
                 pieces.append(piece)
         if name in result:
             result[name] = pieces
@@ -77,10 +76,10 @@ def apply_turn_choices(result, turns, review_id, receipt=None):
         choices = {turn.get("review_choice") for turn in turns
                    if str(turn.get("local_speaker") or turn["speaker"]) == match["local_speaker"]}
         if choices and None not in choices and "unknown" not in choices:
-            match["status"] = "human_verified" if len(choices) == 1 else "human_verified_mixed_cluster"
-            match["reviewed_speakers"] = sorted(choices)
+            match["status"] = "human_excluded" if choices == {"ignore"} else "human_verified" if len(choices) == 1 else "human_verified_mixed_cluster"
+            match["reviewed_speakers"] = sorted(choices - {"ignore"})
             if len(choices) == 1:
-                match["speaker"] = next(iter(choices))
+                match["speaker"] = "SPEAKER_UNKNOWN" if choices == {"ignore"} else next(iter(choices))
         elif "unknown" in choices:
             match["status"] = "unresolved_human"
     active = sorted({str(word.get("speaker") or segment.get("speaker"))
@@ -156,7 +155,7 @@ def save_review(review_dir, source, source_key, fingerprint, local_result, evide
     return path
 
 
-def render_review(path, packet):
+def review_data(path, packet):
     turns = build_turns(normalize_segments(packet["local_result"]))
     annotate_speaker_attribution(turns, packet["local_result"].get("speaker_refinement"))
     from .analysis import annotate_raw_overlap
@@ -173,45 +172,55 @@ def render_review(path, packet):
               "windows": {key: [{k: v for k, v in window.items() if k != "embedding"}
                                  for window in item.get("windows", [])]
                           for key, item in packet["evidence"].items()}}
+    return public
+
+
+def batch_digest(reviews):
+    return stable_hash(sorted((item["packet"], item["review_id"]) for item in reviews))
+
+
+def render_review(path, packet=None, *, public=None):
+    public = review_data(path, packet) if public is None else public
     data = json.dumps(public, ensure_ascii=False).replace("<", "\\u003c")
-    parts = {"__REVIEW_DATA__": data, "__AUDIO__": html.escape(path.with_suffix(".wav").name, quote=True),
-             "__REVIEW_STATE__": Path(__file__).with_name("review_state.js").read_text(encoding="utf-8")}
-    document = re.sub(r"__REVIEW_DATA__|__REVIEW_STATE__|__AUDIO__", lambda match: parts[match.group()],
+    parts = {"__REVIEW_DATA__": data,
+             "__REVIEW_STATE__": Path(__file__).with_name("review_state.js").read_text(encoding="utf-8"),
+             "__REVIEW_IO__": Path(__file__).with_name("review_io.js").read_text(encoding="utf-8")}
+    document = re.sub(r"__REVIEW_DATA__|__REVIEW_STATE__|__REVIEW_IO__", lambda match: parts[match.group()],
                       Path(__file__).with_name("review_page.html").read_text(encoding="utf-8"))
     atomic_write_text(path.with_suffix(".html"), document)
 
 
 def review_index(review_dir):
     root = Path(review_dir) / "speaker-reviews"
-    rows = []
-    catalog = VoiceRegistry(Path(review_dir) / "speaker_registry.json").profiles_for_review()
+    registry = VoiceRegistry(Path(review_dir) / "speaker_registry.json")
+    catalog = registry.profiles_for_review()
+    recordings = []
     for path in sorted(root.glob("*.json")):
         packet = json.loads(path.read_text(encoding="utf-8"))
         if packet.get("version") != 1:
             continue
-        # Regenerate existing pages after an app update without loading any models.
         packet["profiles"] = catalog
         if not packet.get("new_profile_ids"):
-            packet["new_profile_ids"] = VoiceRegistry(Path(review_dir) / "speaker_registry.json").reviewed_profile_ids(packet.get("receipts", []))
+            packet["new_profile_ids"] = registry.reviewed_profile_ids(packet.get("receipts", []))
         packet["matches"] = packet["payload"].get("speaker_identity", {}).get("matches", packet["matches"])
         render_review(path, packet)
-        count = len(packet["pending"])
-        rows.append((not count, packet["source_key"], f'<li><a href="{html.escape(path.with_suffix(".html").name)}">'
-                    f'{html.escape(packet["source_key"])}</a><span class="{"pending" if count else "done"}">'
-                    f'{str(count) + " voice(s) need review" if count else "Speakers assigned"}</span></li>'))
+        recordings.append(review_data(path, packet))
     index = root / "index.html"
-    atomic_write_text(index, '<!doctype html><html lang="en"><meta charset="utf-8">'
-                      '<meta name="viewport" content="width=device-width,initial-scale=1"><title>Speaker reviews</title>'
-                      '<style>body{font:16px/1.5 system-ui;background:#eef2f7;color:#182235;max-width:1000px;margin:auto;padding:24px}'
-                      'h1{color:#13243c}ul{list-style:none;padding:0}li{display:flex;justify-content:space-between;gap:18px;flex-wrap:wrap;background:white;'
-                      'border:1px solid #a7b8ce;border-radius:8px;padding:22px;margin:16px 0}a{color:#174bb5;font-weight:650;overflow-wrap:anywhere}'
-                      'span{padding:3px 10px;border-radius:5px}.pending{background:#ffdf91}.done{background:#d1f1e3}code{background:white;padding:4px}</style>'
-                      '<h1>Speaker reviews</h1><p>Start with recordings that need attention. Confident matches are already selected; '
-                      'you only need to identify uncertain voices and correct exceptions.</p>'
-                      '<p>Each page supports clip playback, profile edits, saved-review import and export. '
-                      'After exporting, use its <strong>Copy apply command</strong> button and run that command in your project terminal.</p>'
-                      '<ul>' + "".join(row for _, _, row in sorted(rows)) + '</ul>'
-                      + ('' if rows else '<p>No recording reviews yet. Add media and run <code>./transcribe-media</code>.</p>') + '</html>')
+    if recordings:
+        recordings.sort(key=lambda item: (not item["pending"], item["source"]))
+        aliases = {}
+        state_path = Path(review_dir) / "speaker-review-batches.json"
+        if state_path.exists():
+            state = json.loads(state_path.read_text(encoding="utf-8"))
+            for batch in state.get("batches", {}).values():
+                for key, value in registry.resolve_profile_ids(batch.get("new_profile_ids", {})).items():
+                    aliases[key] = value if key not in aliases or aliases[key] == value else None
+        render_review(index, public={"kind": "speaker_review_batch", "batch_id": batch_digest(recordings),
+                                     "recordings": recordings, "profiles": catalog,
+                                     "new_profile_ids": {key: value for key, value in aliases.items() if value}})
+    else:
+        atomic_write_text(index, '<!doctype html><meta charset="utf-8"><title>Speaker reviews</title>'
+                          '<h1>Speaker reviews</h1><p>No recording reviews yet. Add media and run ./transcribe-media.</p>')
     return index
 
 
@@ -277,7 +286,7 @@ def _review_references(packet, turns, excluded):
             profile, coverage = next(iter(covered.items()))
             # Diarization intervals include pauses that ASR turns don't cover.
             # Those silent gaps do not invalidate an otherwise reviewed voice.
-            if profile in (None, "unknown") or coverage < min(0.2, window["duration"] * 0.25):
+            if profile in (None, "unknown", "ignore") or coverage < min(0.2, window["duration"] * 0.25):
                 continue
             observation = VoiceRegistry._observation(packet["source_key"], packet["fingerprint"]["sha256"],
                 f'{local}:{window["start"]:.4f}:{window["end"]:.4f}',
@@ -290,10 +299,98 @@ def _review_references(packet, turns, excluded):
 
 def apply_review(review_dir, decision_path):
     decisions = json.loads(Path(decision_path).read_text(encoding="utf-8"))
+    if isinstance(decisions, dict) and decisions.get("kind") == "speaker_review_batch":
+        return apply_batch_review(review_dir, decisions)
+    return _apply_recording_review(review_dir, decisions)
+
+
+def apply_batch_review(review_dir, decisions):
+    """One shared enrollment, all explicit corrections, then a final cached rematch.
+
+    The outer journal covers every recording so any failed import or rematch
+    restores the whole project. Caller holds the normal project lock.
+    """
+    review_dir = Path(review_dir)
+    reviews = decisions.get("reviews")
+    if decisions.get("format_version") != 3 or not isinstance(reviews, list) or not reviews:
+        raise SpeakerRegistryError("batch review needs a nonempty list of recording decisions")
+    if any(not isinstance(item, dict) or not isinstance(item.get("packet"), str) or
+           not isinstance(item.get("review_id"), str) or item.get("format_version") != 2 for item in reviews):
+        raise SpeakerRegistryError("invalid recording decisions in batch review")
+    if len({item["packet"] for item in reviews}) != len(reviews) or batch_digest(reviews) != decisions.get("batch_id"):
+        raise SpeakerRegistryError("batch review identity is invalid or contains duplicate recordings")
+    definitions = decisions.get("new_profiles", {})
+    updates = decisions.get("profile_updates", {})
+    if not isinstance(definitions, dict) or not isinstance(updates, dict) or any(not isinstance(item, dict) for item in updates.values()):
+        raise SpeakerRegistryError("batch profiles must be objects")
+    # Validate source evidence before enrollment. Each recording is checked again
+    # by the regular importer; a later change also rolls back the whole batch.
+    used = set()
+    for item in reviews:
+        packet = _validated_review_packet(review_dir, item)
+        used.update(turn["review_choice"] for turn in _resolve_choices(packet, item))
+    registry = VoiceRegistry(review_dir / "speaker_registry.json")
+    state_path = review_dir / "speaker-review-batches.json"
+    state = json.loads(state_path.read_text()) if state_path.exists() else {"batches": {}}
+    prior = state["batches"].setdefault(decisions["batch_id"], {"new_profile_ids": {}, "receipts": []})
+    receipt = stable_hash(decisions)
+    if prior["receipts"][-1:] == [receipt]:
+        return {"already_applied": True, "batch": True}
+    mapping = registry.resolve_profile_ids(prior["new_profile_ids"])
+    new_profiles = {}
+    for key in sorted(used - {None, "unknown", "ignore"}):
+        if not key.startswith("new:") or key in mapping:
+            continue
+        metadata = definitions.get(key)
+        if not isinstance(metadata, dict):
+            raise SpeakerRegistryError(f"batch lacks a shared profile definition: {key}")
+        label, role = metadata.get("label"), metadata.get("role", "unspecified")
+        if not isinstance(label, str) or not label.strip() or len(label) > 80 or any(ord(c) < 32 for c in label) or role not in ("adult", "child", "unspecified"):
+            raise SpeakerRegistryError("new batch profile needs a short label and valid role")
+        new_profiles[key] = {"label": label.strip(), "role": role}
+    manifest = ManifestStore(review_dir / "transcription_manifest.json")
+    packets = list((review_dir / "speaker-reviews").glob("*.json"))
+    outputs = [Path(value) for entry in manifest.data["sources"].values() for value in entry.get("outputs", {}).values()]
+    transaction = StateTransaction(review_dir, [registry.path, manifest.path, state_path, *packets,
+        *(path.with_suffix(".html") for path in packets), review_dir / "speaker-reviews/index.html", *outputs])
+    transaction.begin()
+    try:
+        created = registry.confirm_references([], new_profiles,
+            stable_hash([decisions["batch_id"], receipt, len(prior["receipts"])]), profile_updates=updates)
+        mapping.update(created)
+        applied = []
+        for original in reviews:
+            item = copy.deepcopy(original)
+            for name in ("assignments", "turn_overrides"):
+                item[name] = {key: mapping.get(value, value) for key, value in item.get(name, {}).items()}
+            for override in item.get("range_overrides", []):
+                override["profile"] = mapping.get(override["profile"], override["profile"])
+            item["new_profiles"], item["profile_updates"] = {}, {}
+            applied.append(_apply_recording_review(review_dir, item, managed=True))
+        # All reviewed references now exist, so processing order cannot determine
+        # the final automatic assignments in any of the cached recordings.
+        refreshed = refresh_reviews(review_dir, managed=True, allow_empty=True)
+        if updates and packets:
+            _sync_profile_labels(ManifestStore(manifest.path), registry.profiles_for_review(), registry.validate(), packets[0])
+        prior["new_profile_ids"] = mapping
+        prior["receipts"].append(receipt)
+        atomic_write_json(state_path, state)
+        review_index(review_dir)
+        transaction.commit()
+    except BaseException:
+        transaction.rollback()
+        raise
+    return {"batch": True, "created_profiles": created, "reviews_applied": len(reviews),
+            "references_saved": sum(item.get("references_saved", 0) for item in applied),
+            "pending": sum(item["pending"] for item in refreshed["recordings"]),
+            "recordings_refreshed": refreshed["recordings"], "review_index": refreshed["review_index"]}
+
+
+def _validated_review_packet(review_dir, decisions):
     if not isinstance(decisions, dict):
         raise SpeakerRegistryError("review decisions must be a JSON object")
     packet_name = decisions.get("packet", "")
-    if Path(packet_name).name != packet_name or not packet_name.endswith(".json"):
+    if not isinstance(packet_name, str) or Path(packet_name).name != packet_name or not packet_name.endswith(".json"):
         raise SpeakerRegistryError("invalid speaker review packet name")
     path = Path(review_dir) / "speaker-reviews" / packet_name
     packet = json.loads(path.read_text(encoding="utf-8"))
@@ -303,6 +400,12 @@ def apply_review(review_dir, decision_path):
         raise SpeakerRegistryError("review references use a different embedding model; regenerate them with the current model")
     if source_fingerprint(Path(packet["source"])) != packet["fingerprint"]:
         raise SpeakerRegistryError("source recording changed after this review was created")
+    return packet
+
+
+def _apply_recording_review(review_dir, decisions, *, managed=False):
+    packet = _validated_review_packet(review_dir, decisions)
+    path = Path(review_dir) / "speaker-reviews" / decisions["packet"]
     receipt = stable_hash(decisions)
     if packet.get("receipts", [])[-1:] == [receipt]:
         return {"already_applied": True, "pending": len(packet["pending"])}
@@ -335,7 +438,7 @@ def apply_review(review_dir, decision_path):
             item["profile"] = prior_ids.get(item["profile"], item["profile"])
     turns = _resolve_choices(packet, combined)
     profiles = {item["voice_id"] for item in registry.profiles_for_review()}
-    used = {turn["review_choice"] for turn in turns} - {None, "unknown"}
+    used = {turn["review_choice"] for turn in turns} - {None, "unknown", "ignore"}
     if any(not isinstance(key, str) for key in used):
         raise SpeakerRegistryError("profile choices must be strings")
     new_profiles = {}
@@ -360,7 +463,8 @@ def apply_review(review_dir, decision_path):
     other_outputs = [Path(value) for record in manifest.data["sources"].values() for value in record.get("outputs", {}).values()]
     transaction = StateTransaction(Path(review_dir), [registry.path, manifest.path, *packets,
                                                      *(item.with_suffix(".html") for item in packets), *other_outputs])
-    transaction.begin()
+    if not managed:
+        transaction.begin()
     try:
         application_id = stable_hash([packet["review_id"], receipt, len(packet.get("receipts", []))])
         created = registry.confirm_references(references, new_profiles, application_id,
@@ -431,11 +535,14 @@ def apply_review(review_dir, decision_path):
         # Label changes describe the same durable person in every transcript.
         if combined["profile_updates"]:
             _sync_profile_labels(manifest, packet["profiles"], registry.validate(), path)
-        transaction.commit()
+        if not managed:
+            transaction.commit()
     except BaseException:
-        transaction.rollback()
+        if not managed:
+            transaction.rollback()
         raise
-    review_index(review_dir)
+    if not managed:
+        review_index(review_dir)
     return {"created_profiles": created, "pending": len(pending), "references_saved": len(references),
             "profiles_needing_audio": [profile["voice_id"] for profile in packet["profiles"] if profile["training_status"] != "ready"],
             "outputs": {key: str(value) for key, value in outputs.items()}}
@@ -511,11 +618,11 @@ def merge_project_profiles(review_dir, duplicate, canonical):
     return {"merged": duplicate, "canonical": canonical, "aliases": aliases, "recordings_updated": len(outputs)}
 
 
-def refresh_reviews(review_dir):
+def refresh_reviews(review_dir, *, managed=False, allow_empty=False):
     review_dir = Path(review_dir)
     registry_path = review_dir / "speaker_registry.json"
     catalog = VoiceRegistry(registry_path).profiles_for_review()
-    if not catalog:
+    if not catalog and not allow_empty:
         raise SpeakerRegistryError("confirm the first voice profiles before refreshing matches")
     manifest = ManifestStore(review_dir / "transcription_manifest.json")
     refreshed = []
@@ -529,7 +636,7 @@ def refresh_reviews(review_dir):
         if not entry or entry.get("source_fingerprint") != packet["fingerprint"]:
             raise SpeakerRegistryError("review and processing manifest no longer agree")
         settings = packet["payload"]["processing"].get("settings", {})
-        registry = VoiceRegistry(registry_path, reviewed=True, learn=False,
+        registry = VoiceRegistry(registry_path, reviewed=True, learn=not bool(catalog),
                                  known_voices=settings.get("known_voices", ()),
                                  match_threshold=settings.get("speaker_match_threshold", .45),
                                  match_margin=settings.get("speaker_match_margin", .12))
@@ -561,7 +668,8 @@ def refresh_reviews(review_dir):
                                                                     "acoustic_and_tone_recompute_required": True}
         outputs = {key: Path(value) for key, value in entry["outputs"].items()}
         transaction = StateTransaction(review_dir, [manifest.path, path, path.with_suffix(".html"), *outputs.values()])
-        transaction.begin()
+        if not managed:
+            transaction.begin()
         try:
             write_outputs(outputs, payload)
             packet.update(payload=payload, pending=pending, profiles=catalog, matches=report["matches"])
@@ -571,9 +679,11 @@ def refresh_reviews(review_dir):
             if not entry.get("retry_recommended"):
                 entry.update(status="awaiting_review" if pending else "complete", completion_state=True)
             manifest.update(packet["source_key"], entry)
-            transaction.commit()
+            if not managed:
+                transaction.commit()
         except BaseException:
-            transaction.rollback()
+            if not managed:
+                transaction.rollback()
             raise
         refreshed.append({"source": packet["source_key"], "pending": len(pending)})
-    return {"recordings": refreshed, "review_index": str(review_index(review_dir))}
+    return {"recordings": refreshed, "review_index": str(Path(review_dir) / "speaker-reviews/index.html") if managed else str(review_index(review_dir))}

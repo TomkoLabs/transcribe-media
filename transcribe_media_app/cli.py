@@ -243,9 +243,9 @@ def build_parser() -> argparse.ArgumentParser:
               "2–3 speakers, full decoding, no inferred tone; --no-quality "
               "restores the legacy automatic-enrollment/batched workflow"),
     )
-    parser.add_argument("--review-speakers", action="store_true", help="build the offline speaker review index without loading models")
+    parser.add_argument("--review-speakers", action="store_true", help="build the aggregated offline speaker review page without loading models")
     parser.add_argument("--refresh-voices", action="store_true", help="rematch cached recordings against verified profiles without rerunning ASR")
-    parser.add_argument("--apply-speaker-review", metavar="DECISIONS_JSON", help="apply exported human speaker decisions and regenerate transcripts without ASR")
+    parser.add_argument("--apply-speaker-review", metavar="DECISIONS_JSON", help="apply a recording or batch review; batch reviews also rematch all cached transcripts without ASR")
     parser.add_argument("--merge-voices", nargs=2, metavar=("DUPLICATE_ID", "CANONICAL_ID"), help="merge a reviewed duplicate profile into a canonical ID and update transcripts")
     parser.add_argument("--evaluate-voices", action="store_true", help="evaluate verified references across held-out recordings; no model loading")
     parser.add_argument(
@@ -2176,13 +2176,21 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 elif args.refresh_voices:
                     print(json.dumps(review.refresh_reviews(paths.review_dir), indent=2))
                 elif args.apply_speaker_review:
-                    applied = review.apply_review(paths.review_dir, args.apply_speaker_review)
+                    decision_path = Path(args.apply_speaker_review).expanduser()
+                    if not decision_path.is_absolute() and decision_path.parts and decision_path.parts[0] == "speaker-decisions":
+                        decision_path = paths.root / decision_path
+                    if not decision_path.is_file():
+                        raise ValueError(f"decision JSON not found: {decision_path}. Save the exported JSON inside this project's speaker-decisions/ folder, then use its relative path. A browser download may still be in your chosen downloads folder.")
+                    applied = review.apply_review(paths.review_dir, decision_path)
                     print(json.dumps(applied, indent=2))
                     if not applied.get("already_applied"):
                         print("Speaker corrections applied to the transcript.")
                         if applied.get("profiles_needing_audio"):
                             print("Some profiles are still collecting voice references. Their transcript labels are saved; add more clean reviewed clips over time.")
-                    print("Open the review index again for remaining uncertain voices. Use --refresh-voices to update other cached recordings.")
+                    if applied.get("batch"):
+                        print("Batch review applied and cached transcripts refreshed. Reopen the review index for remaining uncertain voices.")
+                    else:
+                        print("Open the review index again for remaining uncertain voices. Use --refresh-voices to update other cached recordings.")
                 elif args.merge_voices:
                     print(json.dumps(review.merge_project_profiles(paths.review_dir, *args.merge_voices), indent=2))
                 else:

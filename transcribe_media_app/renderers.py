@@ -59,6 +59,15 @@ def _speaker_is_uncertain(turn: dict[str, Any]) -> bool:
     return (turn.get("speaker_attribution") or {}).get("status") == "uncertain"
 
 
+def speaker_display(speaker, profiles=()):
+    speaker = speaker or "SPEAKER_UNKNOWN"
+    if speaker == "SPEAKER_UNKNOWN":
+        return "UNKNOWN"
+    profile = next((item for item in profiles if item["voice_id"] == speaker), {})
+    label = profile.get("label")
+    return f"{label} [{speaker}]" if label and label != speaker else speaker
+
+
 def render_detailed_txt(payload: dict[str, Any]) -> str:
     source = payload["source"]
     processing = payload["processing"]
@@ -146,7 +155,7 @@ def render_detailed_txt(payload: dict[str, Any]) -> str:
     for turn in payload.get("turns") or []:
         start = format_timestamp(turn.get("start"))
         end = format_timestamp(turn.get("end"))
-        speaker = turn.get("speaker") or "SPEAKER_UNKNOWN"
+        speaker = speaker_display(turn.get("speaker"), payload.get("speaker_profiles", []))
         observations = turn.get("observations") or []
         observed = "; ".join(str(item.get("label")) for item in observations)
         if not observed:
@@ -318,7 +327,7 @@ def render_txt(payload: dict[str, Any]) -> str:
         )
         lines.extend(
             [
-                f"{paragraph['speaker']}{uncertainty}:",
+                f"{speaker_display(paragraph['speaker'], payload.get('speaker_profiles', []))}{uncertainty}:",
                 paragraph["text"],
             ]
         )
@@ -334,10 +343,10 @@ def render_txt(payload: dict[str, Any]) -> str:
     return "\n".join(lines).rstrip() + "\n"
 
 
-def render_srt(segments: list[dict[str, Any]]) -> str:
+def render_srt(segments: list[dict[str, Any]], profiles=()) -> str:
     blocks = []
     for index, segment in enumerate(segments, start=1):
-        speaker = segment.get("speaker") or "SPEAKER_UNKNOWN"
+        speaker = speaker_display(segment.get("speaker"), profiles)
         text = str(segment.get("text") or "").strip()
         blocks.append(
             "\n".join(
@@ -352,10 +361,10 @@ def render_srt(segments: list[dict[str, Any]]) -> str:
     return "\n\n".join(blocks) + ("\n" if blocks else "")
 
 
-def render_vtt(segments: list[dict[str, Any]]) -> str:
+def render_vtt(segments: list[dict[str, Any]], profiles=()) -> str:
     blocks = []
     for segment in segments:
-        speaker = segment.get("speaker") or "SPEAKER_UNKNOWN"
+        speaker = speaker_display(segment.get("speaker"), profiles)
         text = str(segment.get("text") or "").strip()
         blocks.append(
             "\n".join(
@@ -383,8 +392,8 @@ def write_outputs(
         elif format_name == "json":
             atomic_write_json(path, payload)
         elif format_name == "srt":
-            atomic_write_text(path, render_srt(segments))
+            atomic_write_text(path, render_srt(segments, payload.get("speaker_profiles", [])))
         elif format_name == "vtt":
-            atomic_write_text(path, render_vtt(segments))
+            atomic_write_text(path, render_vtt(segments, payload.get("speaker_profiles", [])))
         else:
             raise ValueError(f"unsupported output format: {format_name}")
