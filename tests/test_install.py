@@ -119,7 +119,9 @@ class InstallerFlowTests(unittest.TestCase):
             self.assertIn("launcher --prepare-models --device cuda", log)
             self.assertNotIn("--no-quality", log)
             self.assertIn("Quality mode is enabled by default", result.stdout)
-            self.assertIn("--apply-speaker-review", result.stdout)
+            self.assertIn("Download JSON", result.stdout)
+            self.assertIn("speaker-decisions", result.stdout)
+            self.assertIn("Copy apply command", result.stdout)
 
     def test_gpu_failures_never_install_cpu_or_report_success(self):
         for failure in ("wheels", "kernels", "models"):

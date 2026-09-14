@@ -13,6 +13,40 @@ from transcribe_media_app.renderers import write_outputs
 
 
 class SmoothReviewTests(unittest.TestCase):
+    def test_all_spoken_words_reviewed_resolves_group_without_assigning_silence(self):
+        from transcribe_media_app.analysis import build_turns, normalize_segments
+        with tempfile.TemporaryDirectory() as directory:
+            review, path, decisions, _, _, _, outputs = fixture(Path(directory))
+            packet = json.loads(path.read_text())
+            packet['local_result']['segments'][0]['words'] = [
+                {'word': str(i), 'start': start, 'end': end, 'speaker': 'A'}
+                for i, (start, end) in enumerate(((.5, 1.5), (5., 6.), (9.5, 10.5)))]
+            packet['review_id'] = packet_digest(packet); atomic_write_json(path, packet)
+            decision = json.loads(decisions.read_text()); decision['review_id'] = packet['review_id']
+            del decision['assignments']['A']
+            turn = build_turns(normalize_segments(packet['local_result']))[0]
+            decision['range_overrides'] = [{'turn_id': turn['id'], 'start': start, 'end': end, 'profile': 'new:Adult A'}
+                for start, end in ((.6, 1.4), (5.1, 5.9), (9.6, 10.4))]
+            atomic_write_json(decisions, decision)
+            self.assertEqual(apply_review(review, decisions)['pending'], 0)
+            self.assertNotIn('DRAFT:', outputs['txt'].read_text())
+
+    def test_word_at_correction_boundary_uses_the_later_interval(self):
+        from transcribe_media_app.review import apply_turn_choices
+        result={'segments':[{'speaker':'A','start':0.,'end':10.,'words':[{'word':'boundary','speaker':'A','start':4.,'end':6.}]}]}
+        turns=[{'speaker':'A','start':0.,'end':5.,'review_choice':'VOICE_0001'},
+               {'speaker':'A','start':5.,'end':10.,'review_choice':'VOICE_0002'}]
+        apply_turn_choices(result,turns,'synthetic')
+        self.assertEqual(result['segments'][0]['words'][0]['speaker'],'VOICE_0002')
+
+    def test_zero_duration_final_word_can_still_be_reviewed(self):
+        from transcribe_media_app.review import apply_turn_choices
+        result = {'segments': [{'speaker': 'A', 'start': 0., 'end': 10.,
+                  'words': [{'word': 'yes', 'speaker': 'A', 'start': 10., 'end': 10.}]}]}
+        turns = [{'speaker': 'A', 'start': 0., 'end': 10., 'review_choice': 'VOICE_0001'}]
+        apply_turn_choices(result, turns, 'synthetic')
+        self.assertEqual(result['segments'][0]['words'][0]['speaker'], 'VOICE_0001')
+
     def test_no_reference_audio_still_saves_new_people_and_transcript(self):
         with tempfile.TemporaryDirectory() as directory:
             review, path, decisions, registry, _, _, outputs = fixture(Path(directory))

@@ -74,6 +74,11 @@ from .storage import (
     utc_now,
 )
 
+SAVED_RESULT_ACTIONS = (
+    "review_speakers", "refresh_voices", "apply_speaker_review",
+    "merge_voices", "evaluate_voices", "render_transcripts",
+)
+
 # Disable optional dependency telemetry before WhisperX imports pyannote. Model
 # downloads still work, but normal processing emits no usage traces.
 os.environ.setdefault("PYANNOTE_METRICS_ENABLED", "0")
@@ -244,6 +249,7 @@ def build_parser() -> argparse.ArgumentParser:
               "restores the legacy automatic-enrollment/batched workflow"),
     )
     parser.add_argument("--review-speakers", action="store_true", help="build the aggregated offline speaker review page without loading models")
+    parser.add_argument("--render-transcripts", action="store_true", help="regenerate text/subtitle exports from saved JSON; preserve words, speakers and profiles without loading models")
     parser.add_argument("--refresh-voices", action="store_true", help="rematch cached recordings against verified profiles without rerunning ASR")
     parser.add_argument("--apply-speaker-review", metavar="DECISIONS_JSON", help="apply a recording or batch review; batch reviews also rematch all cached transcripts without ASR")
     parser.add_argument("--merge-voices", nargs=2, metavar=("DUPLICATE_ID", "CANONICAL_ID"), help="merge a reviewed duplicate profile into a canonical ID and update transcripts")
@@ -433,8 +439,10 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def _validate_args(parser: argparse.ArgumentParser, args: argparse.Namespace) -> None:
-    if sum(bool(getattr(args, key)) for key in ("review_speakers", "refresh_voices", "apply_speaker_review", "merge_voices", "evaluate_voices")) > 1:
-        parser.error("choose one speaker review action per command")
+    if sum(bool(getattr(args, key)) for key in (*SAVED_RESULT_ACTIONS, "doctor", "prepare_models", "configure")) > 1:
+        parser.error("choose one maintenance action per command")
+    if args.dry_run and any(getattr(args, key) for key in SAVED_RESULT_ACTIONS):
+        parser.error("--dry-run previews transcription only; omit it when running a saved-result action")
     if args.quality:
         if args.speakers is None and args.min_speakers is None and args.max_speakers is None:
             args.min_speakers, args.max_speakers = 2, 3
@@ -2164,14 +2172,18 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             logging.getLogger(logger_name).setLevel(logging.WARNING)
     if args.configure:
         return configure(args)
-    if args.review_speakers or args.refresh_voices or args.apply_speaker_review or args.merge_voices or args.evaluate_voices:
+    if any(getattr(args, key) for key in SAVED_RESULT_ACTIONS):
         from .storage import project_lock, StateTransaction
         from . import review
         paths = resolve_paths(args)
         try:
             with project_lock(paths.review_dir):
                 StateTransaction(paths.review_dir).rollback()
-                if args.review_speakers:
+                if args.render_transcripts:
+                    from .exports import render_saved_transcripts
+                    rendered = render_saved_transcripts(paths.review_dir)
+                    print(f"Rendered {rendered['recordings_rendered']} recording(s), {rendered['files_written']} text/subtitle file(s) from saved JSON. Words, speakers and voice profiles are unchanged.")
+                elif args.review_speakers:
                     print(f"Open: {review.review_index(paths.review_dir)}")
                 elif args.refresh_voices:
                     print(json.dumps(review.refresh_reviews(paths.review_dir), indent=2))
@@ -2198,7 +2210,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     print(json.dumps(evaluate_registry(paths.review_dir), indent=2))
             return 0
         except (OSError, ValueError, RuntimeError) as exc:
-            print(f"Speaker review failed: {_safe_error(exc)}", file=sys.stderr)
+            print(f"Maintenance failed: {_safe_error(exc)}", file=sys.stderr)
             return 1
     if args.doctor:
         return doctor(args)

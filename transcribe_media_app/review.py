@@ -36,20 +36,31 @@ def _segmentation_key(result):
 
 
 def apply_turn_choices(result, turns, review_id, receipt=None):
+    turns_by_local = {}
+    for turn in turns:
+        turns_by_local.setdefault(str(turn.get("local_speaker") or turn["speaker"]), []).append(turn)
+
     def choice_at(local, start, end):
         middle = (start + end) / 2
-        return next((turn.get("review_choice") for turn in turns
-                     if turn["start"] <= middle <= turn["end"]
-                     and str(turn.get("local_speaker") or turn["speaker"]) == local), None)
+        candidates = turns_by_local.get(local, [])
+        chosen = next((turn for turn in candidates if turn["start"] <= middle < turn["end"]), None)
+        # Alignment can give a final word zero duration. Include that endpoint,
+        # while shared correction boundaries still belong to the later interval.
+        if chosen is None:
+            chosen = next((turn for turn in reversed(candidates) if middle == turn["end"]), None)
+        return chosen.get("review_choice") if chosen is not None else None
 
+    spoken_choices = {}
     for segment in result.get("segments", []):
         for unit in segment.get("words") or [segment]:
             local = str(unit.get("local_speaker") or segment.get("local_speaker") or unit.get("speaker") or segment["speaker"])
             if local == "SPEAKER_UNKNOWN" and segment.get("local_speaker"):
                 local = str(segment["local_speaker"])
             if unit.get("start") is None or unit.get("end") is None:
+                spoken_choices.setdefault(local, set()).add(None)
                 continue
             choice = choice_at(local, float(unit["start"]), float(unit["end"]))
+            spoken_choices.setdefault(local, set()).add(choice)
             if choice is None:
                 continue
             unit["speaker"] = "SPEAKER_UNKNOWN" if choice in ("unknown", "ignore") else choice
@@ -73,8 +84,9 @@ def apply_turn_choices(result, turns, review_id, receipt=None):
             result[name] = pieces
     report = result.get("speaker_identity") or {}
     for match in report.get("matches", []):
-        choices = {turn.get("review_choice") for turn in turns
-                   if str(turn.get("local_speaker") or turn["speaker"]) == match["local_speaker"]}
+        # Match the words we actually assigned, not pauses or trimmed boundaries
+        # between them. Reviewing samples must not verify other unreviewed words.
+        choices = spoken_choices.get(match["local_speaker"], set())
         if choices and None not in choices and "unknown" not in choices:
             match["status"] = "human_excluded" if choices == {"ignore"} else "human_verified" if len(choices) == 1 else "human_verified_mixed_cluster"
             match["reviewed_speakers"] = sorted(choices - {"ignore"})
@@ -184,8 +196,11 @@ def render_review(path, packet=None, *, public=None):
     data = json.dumps(public, ensure_ascii=False).replace("<", "\\u003c")
     parts = {"__REVIEW_DATA__": data,
              "__REVIEW_STATE__": Path(__file__).with_name("review_state.js").read_text(encoding="utf-8"),
-             "__REVIEW_IO__": Path(__file__).with_name("review_io.js").read_text(encoding="utf-8")}
-    document = re.sub(r"__REVIEW_DATA__|__REVIEW_STATE__|__REVIEW_IO__", lambda match: parts[match.group()],
+             "__REVIEW_IO__": Path(__file__).with_name("review_io.js").read_text(encoding="utf-8"),
+             "__REVIEW_PLAYBACK__": Path(__file__).with_name("review_playback.js").read_text(encoding="utf-8"),
+             "__REVIEW_CONTROLLER__": Path(__file__).with_name("review_page.js").read_text(encoding="utf-8"),
+             "__REVIEW_CSS__": Path(__file__).with_name("review_page.css").read_text(encoding="utf-8")}
+    document = re.sub("|".join(parts), lambda match: parts[match.group()],
                       Path(__file__).with_name("review_page.html").read_text(encoding="utf-8"))
     atomic_write_text(path.with_suffix(".html"), document)
 

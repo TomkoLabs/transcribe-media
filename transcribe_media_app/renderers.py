@@ -235,13 +235,21 @@ def _condensed_paragraphs(turns: list[dict[str, Any]]) -> list[dict[str, Any]]:
         if not text:
             continue
         speaker = str(turn.get("speaker") or "SPEAKER_UNKNOWN")
-        uncertain = _speaker_is_uncertain(turn)
         words = len(text.split())
+        pause = float(turn.get("pause_before_seconds") or 0.0)
+        if paragraphs:
+            previous_end = paragraphs[-1]["turns"][-1].get("end")
+            start = turn.get("start")
+            if all(isinstance(value, (int, float)) and math.isfinite(value) for value in (start, previous_end)):
+                # Human review rebuilds turns without acoustic annotations.
+                # Their timestamps still preserve pauses in the conversation.
+                pause = max(pause, start - previous_end)
         can_merge = bool(
             paragraphs
             and paragraphs[-1]["speaker"] == speaker
-            and paragraphs[-1]["uncertain"] == uncertain
-            and float(turn.get("pause_before_seconds") or 0.0) < 2.0
+            # UNKNOWN can represent different people, so keep those turns apart.
+            and speaker != "SPEAKER_UNKNOWN"
+            and pause < 2.0
             and paragraphs[-1]["word_count"] + words
             <= CONDENSED_MAX_PARAGRAPH_WORDS
         )
@@ -254,7 +262,6 @@ def _condensed_paragraphs(turns: list[dict[str, Any]]) -> list[dict[str, Any]]:
             paragraphs.append(
                 {
                     "speaker": speaker,
-                    "uncertain": uncertain,
                     "text": text,
                     "word_count": words,
                     "turns": [turn],
@@ -306,28 +313,24 @@ def render_txt(payload: dict[str, Any]) -> str:
         annotations = [str(profile["label"])] if profile.get("label") and profile["label"] != voice else []
         if profile.get("role") in ("adult", "child"):
             annotations.append(str(profile["role"]))
-        display.append(voice + (f" ({'; '.join(annotations)})" if annotations else ""))
+        display.append(("UNKNOWN" if voice == "SPEAKER_UNKNOWN" else voice)
+                       + (f" ({'; '.join(annotations)})" if annotations else ""))
     lines = [
         "DRAFT: SPEAKER REVIEW REQUIRED" if (payload.get("speaker_review") or {}).get("pending") else "ANALYSIS-READY TRANSCRIPT",
         "=========================",
         f"Source: {source.get('relative_path') or source.get('path')}",
         f"Language: {language.get('output') or language.get('detected') or 'unknown'}",
         f"Speakers: {', '.join(display) if display else 'none detected'}",
-        "ASR wording is preserved and not summarized. Speaker attribution and",
-        "selective vocal-tone labels are probabilistic; verify consequential passages",
-        "against the recording. Full timestamps, evidence, and scores are in Review.",
+        "Words are preserved. Timestamps and speaker review details are in Review.",
         "",
         "TRANSCRIPT",
         "----------",
         "",
     ]
     for paragraph in _condensed_paragraphs(turns):
-        uncertainty = (
-            " [speaker attribution uncertain]" if paragraph["uncertain"] else ""
-        )
         lines.extend(
             [
-                f"{speaker_display(paragraph['speaker'], payload.get('speaker_profiles', []))}{uncertainty}:",
+                f"{speaker_display(paragraph['speaker'], payload.get('speaker_profiles', []))}:",
                 paragraph["text"],
             ]
         )

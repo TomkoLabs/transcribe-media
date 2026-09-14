@@ -308,8 +308,10 @@ Then run:
 Quality mode is enabled by default: English, 2-3 speakers, reviewed voice profiles.
 After processing, open this file in your browser to confirm the initial voices:
   $ROOT/Review/speaker-reviews/index.html
-Export decisions there, then apply them:
-  $LAUNCHER --apply-speaker-review /path/to/downloaded.decisions.json
+Choose Download JSON, then move the file into:
+  $ROOT/speaker-decisions
+Use Copy apply command on the page and run it from the project folder.
+One batch apply updates transcripts and refreshes cached voice matches.
 
 Useful checks:
   $LAUNCHER --doctor

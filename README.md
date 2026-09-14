@@ -1,47 +1,26 @@
 # transcribe-media
 
-Private, local transcription with persistent speaker identities and an offline
-voice-review page. Designed for **two adults, with an occasional child**, with
-quality preferred over speed. Audio stays on the machine running the script.
-
-**Quality mode is the default.** After installation, the everyday command is:
-
-```bash
-./transcribe-media
-```
-
-It uses Whisper **large-v3**, word alignment, speaker diarization, and conservative
-matching against human-reviewed voice references. You do not need model, GPU,
-batch-size, speaker-count, or quality flags for the baseline case.
+Local transcription with persistent speaker identities and an offline review
+page. Optimized for **two adults, with an occasional child**, with quality over
+speed. **Quality mode is the default:** Whisper large-v3, word alignment,
+speaker diarization and conservative matching against reviewed voice references.
+Audio stays on the machine running the script.
 
 ## Quick start: Debian + RTX 3080
 
-### 1. Prepare the machine and model access
+### 1. Prepare once
 
-Use Debian 12/13 on an x86-64 PC with a working NVIDIA driver. Run `nvidia-smi`;
-it must list your RTX 3080. The installer supplies the Python/CUDA libraries but
-**does not install the GPU driver**. A separate CUDA toolkit is unnecessary on
-this x86-64 path. See [NVIDIA's driver compatibility guidance](https://docs.nvidia.com/deploy/cuda-compatibility/minor-version-compatibility.html)
-if the runtime reports an insufficient driver.
+- Debian 12/13, x86-64, with a working NVIDIA driver: `nvidia-smi` must list your
+  GPU. The installer supplies Python/CUDA libraries, but does not install the
+  driver. No separate CUDA toolkit is needed on this PC setup.
+- RTX 3080 with 10 or 12 GB VRAM is the target. Budget roughly 32 GB system RAM
+  and 30 GB free disk, plus recordings and outputs; these are planning estimates.
+- Accept [pyannote Community-1 access](https://huggingface.co/pyannote/speaker-diarization-community-1)
+  and create a [Hugging Face read token](https://huggingface.co/settings/tokens).
+  Paste the token into the installer's hidden prompt. Model downloads need
+  internet access; your recordings are processed locally.
 
-Plan for **32 GB system RAM and 30 GB free disk** as a practical starting budget,
-plus recordings, model caches, transcripts and review audio. These are planning
-estimates, not measured minimums. An RTX 3080 with 10 or 12 GB VRAM is the target.
-
-For the recommended speaker models, sign into Hugging Face and:
-
-1. Accept the access conditions for [pyannote Community-1](https://huggingface.co/pyannote/speaker-diarization-community-1).
-2. Create a [read access token](https://huggingface.co/settings/tokens). Paste it
-   into the installer's hidden prompt when asked. Do not put it in source files.
-
-This enables downloading the diarizer for local use; it does not send your
-recordings to Hugging Face.
-
-### 2. Install once
-
-Clone this repository using its GitHub **Code → HTTPS** URL, then enter its
-`transcribe-media` directory. If you already have the checkout, skip cloning.
-The intended GitHub location is shown below; use your own URL for a fork/mirror.
+### 2. Install
 
 ```bash
 sudo apt-get update
@@ -52,208 +31,106 @@ cd transcribe-media
 ./install.sh
 ```
 
-Run the installer as your normal user; it requests `sudo` for system packages.
-It installs FFmpeg, creates its own Python 3.11 environment, installs the pinned
-ML stack, prompts for the token, downloads the default models, and runs local
-inference checks. Internet access is needed for setup. Allow time for large
-downloads; no separate `pip`, virtual-environment activation, model preparation,
-or CUDA flags are needed.
+Use your repository URL if using a fork/mirror; skip cloning for an existing
+checkout. Run the installer as your normal user. It requests `sudo` for system
+packages, installs FFmpeg and its own Python environment, downloads the models,
+and checks local inference. No separate `pip`, environment activation or model
+flags are needed. If GPU validation fails, fix the reported error before running.
 
-If NVIDIA is detected but CUDA installation or validation fails, installation
-stops with an error. Fix that error before processing. If no working driver is
-found, the installer explicitly warns that it is installing CPU mode.
+### 3. Transcribe
 
-### 3. Add recordings and run
-
-Put audio/video files into **`Video Source/`**, then run:
+Put all your audio/video files in **`Video Source/`**, then run:
 
 ```bash
 ./transcribe-media
 ```
 
-Read transcripts in **`Transcribed/`**. The terminal prints progress and a link
-path to **`Review/speaker-reviews/index.html`**. Processing is incremental: add
-more recordings and run the same command again. Completed, unchanged files are
-skipped; files awaiting human review do not repeatedly rerun transcription.
+Read transcripts in **`Transcribed/`**. Add more files and run the same command
+again; completed, unchanged files are skipped. No best first recording is needed.
+The default allows **2–3 speakers**. Use `--speakers 2` only if exactly two people
+speak in every file; use `--min-speakers 1 --max-speakers 3` for batches that also
+contain solo recordings.
 
-### 4. Review the whole batch, then apply once
+### 4. Review and apply once
 
-You can put all your videos in `Video Source/` and process them together, even
-before any voice profiles exist. Open **`Review/speaker-reviews/index.html`** in
-your browser when processing finishes. It is one review page for all recordings;
-no web server is required and you do not need to choose a best first recording.
+Open **`Review/speaker-reviews/index.html`** in your browser. No server is needed.
 
-- Use **Recording** or **Next needing attention** to move through the batch.
-  Confident matches are already selected; uncertain groups have no person selected.
-- Listen to several clips, then assign **Adult A**, **Adult B**, **Child**, or an
-  existing person. **People & profile labels** is shared across the whole batch.
-  Local speaker numbers can refer to different people in different recordings.
-- Use **Change only this clip** or **All soundbites** to correct exceptions.
-  Uncheck unsuitable training clips. Choose **UNKNOWN — exclude from voice
-  learning** to keep a passage anonymous and exclude it from training, or
-  **Unknown / review later** if it still needs attention.
-- Click **Save to project** and select the project folder containing
-  `transcribe-media`. The page creates/saves its JSON in **`speaker-decisions/`**.
-  The browser remembers the selected folder during the page session. If folder
-  saving is unavailable, use **Download JSON** and move the file into
-  `speaker-decisions/` yourself; a web page cannot discover your download path.
-- Click **Copy apply command** and run it from the project folder. It will look like:
+1. Start with **Needs attention**. Confident matches are already assigned.
+   Listen, then select Adult A, Adult B, Child, or the same existing person across
+   recordings. **People & profile labels** manages the shared names.
+2. Correct exceptions using **Change only this clip** or **All soundbites**.
+   Listen includes surrounding audio, with extra context for uncertain clips.
+   Partial corrections have preview and playhead controls. Uncheck noisy/mixed
+   training clips; choose **UNKNOWN — exclude from voice learning** for passages
+   you want to leave anonymous without further identity review.
+3. **Download JSON**, then move that file into **`speaker-decisions/`** inside
+   this project. Keep its filename. Download location depends on your browser.
+4. **Copy apply command** and run it from the project folder. For example:
 
 ```bash
 ./transcribe-media --apply-speaker-review "speaker-decisions/batch-REPLACE_WITH_EXPORTED_ID.decisions.json"
 ```
 
-Use the actual filename from the copied command. **One batch apply saves all
-manual corrections and reviewed references, then rematches all cached recordings
-with the final profiles.** No separate refresh command is needed for a batch
-export. Unreviewed recordings can gain confident matches; remaining uncertainty
-stays visible when you reopen the page. Manually confirmed choices always win.
+Use the actual filename in the copied command. **One batch apply updates all
+reviewed transcripts, learns from approved clips, and rematches cached recordings.**
+It preserves manual choices and recognized words; no retranscription or separate
+refresh is needed. Reopen the page to see remaining uncertainty.
 
-**Import saved review** resumes an exported batch or imports a single recording's
-older decisions. The browser also keeps a local draft when storage is available.
-Saving a JSON alone does not change transcripts. A batch failure rolls back the
-whole update, so a stale recording cannot leave half the batch applied.
+Turns show **`Adult A [VOICE_0001]:`**, without repeated uncertainty notes.
+Transcript filenames stay unchanged. Unresolved voices keep one draft notice
+at the top; detailed diagnostics stay in `Review/`. **Import saved review** resumes an
+exported file; local browser drafts also save when available. Downloading alone
+does not update transcripts. Optional direct folder saving is under **Apply
+command & optional folder saving**; use the download steps if the browser blocks it.
 
-Readable turns show names and durable IDs, for example **`Adult A [VOICE_0001]:`**.
-JSON keeps the stable ID and profile metadata. Transcript filenames do not change.
-Unresolved voices keep the transcript marked **`DRAFT: SPEAKER REVIEW REQUIRED`**;
-explicitly excluded UNKNOWN passages remain in the text without requiring further
-identity review. UNKNOWN does not prove that a different person spoke.
-
-For later profile improvements outside a batch apply, use:
-
-```bash
-./transcribe-media --refresh-voices
-```
-
-This rematches saved speaker evidence and rewrites speaker assignments without
-rerunning speech recognition or changing the recognized wording. Clean reviewed
-clips from different rooms, microphones and sessions improve reference coverage;
-processing everything first does not remove the need for good references.
-Scores are **similarities, not calibrated probabilities**. Human speaker review
-does not certify every recognized word, and adult/child roles are supplied by you.
-
-### Updating the review page
-
-For an existing installation, update the source and regenerate the pages:
+## Update an existing installation
 
 ```bash
 git pull --ff-only
+./transcribe-media --render-transcripts
 ./transcribe-media --review-speakers
 ```
 
-No reinstall or retranscription is needed for this review update. Reopen the HTML
-page after regenerating it. You can retry an existing failed decisions file with
-`--apply-speaker-review`; short or missing reference audio no longer blocks saving
-the chosen people. The original recording and speaker boundaries must still match.
-Profiles show **untrained**, **collecting**, or **ready** separately from their
-transcript labels. See [the quality guide](QUALITY_GUIDE.md) for short-clip learning,
-profile edits and restoring saved reviews.
+This updates saved text/subtitles and review pages without running models.
+Words, speaker assignments and profiles stay unchanged. Reopen the regenerated HTML.
+No reinstall is needed for this update.
+Run `./install.sh` again when a future update changes model/dependency requirements.
+Back up first: version/settings changes can cause normal processing to rerun.
 
-## Defaults and the few useful options
+## Useful commands
 
 | Need | Command |
 | --- | --- |
-| Normal quality run; two adults and possibly a child | `./transcribe-media` |
-| Exactly two people speak in every recording | `./transcribe-media --speakers 2` |
-| One-person recordings or excerpts | `./transcribe-media --speakers 1` |
-| Include subdirectories | `./transcribe-media --recursive` |
-| A different spoken language | `./transcribe-media --language fr` (or `--language auto`) |
-| Freeze automatic profile learning after sufficient review | `./transcribe-media --no-speaker-learning` |
-| Check installation and require working CUDA | `./transcribe-media --doctor --device cuda` |
+| Rematch cached transcripts after other profile improvements; wording stays unchanged | `./transcribe-media --refresh-voices` |
+| Freeze automatic profile learning; explicit reviews still apply | `./transcribe-media --no-speaker-learning` |
+| Include source subfolders | `./transcribe-media --recursive` |
+| Change language | `./transcribe-media --language fr` or `--language auto` |
+| Diagnose GPU setup | `./transcribe-media --doctor --device cuda` |
 
-Do not use `--speakers 2` when a child might speak. The default range is **2–3**;
-if some files contain only one speaker, use `--min-speakers 1 --max-speakers 3`.
-Freezing preserves conservative matching and leaves uncertain voices for review.
-Explicit human review imports can still update a frozen registry.
+## Files and quality notes
 
-With the recommended NVIDIA installation and token, automatic backend selection
-uses **Community-1 plus Sortformer** as a second opinion. Without NeMo it uses
-Community-1 alone. Without a token it can use Sortformer, or the weaker SpeechBrain
-window-clustering fallback. The selected backend appears in the run output and
-JSON. Configure the token to follow the recommended quality setup.
+- **`Video Source/`**: originals, never modified by processing.
+- **`Transcribed/`**: readable transcripts.
+- **`Review/`**: detailed JSON, voice registry, caches and review HTML/audio.
+- **`speaker-decisions/`**: exported manual decisions.
 
-Inferred vocal tone is off by default. Measured timing/acoustic observations
-remain available. All advanced options are under `./transcribe-media --help`;
-review, duplicate-profile repair, evaluation, and model tradeoffs are explained
-in [QUALITY_GUIDE.md](QUALITY_GUIDE.md).
+**Back up all four together.** They contain private material and are ignored by
+Git. Keep originals at the same location while reviewing, and keep review HTML
+beside its WAV files when copying to another computer. Custom source folders
+still use this checkout's output directories and shared registry by default.
 
-## Outputs, reruns and backups
+Collect clean reviewed clips from several sessions for each person. Similarity
+scores are not probabilities, and adult/child roles are supplied by you. Noise,
+short replies and overlapping speech can still confuse the models. Verify
+consequential words and speaker assignments against the recording before use
+in therapist analysis; the script provides no therapeutic interpretation.
 
-| Location | Contents |
-| --- | --- |
-| `Video Source/` | Your original media; never modified by processing |
-| `Transcribed/` | Readable TXT transcripts with speaker turns and uncertainty |
-| `Review/` | Detailed JSON, manifest, persistent voice registry, ASR cache and review pages/audio |
-| `speaker-decisions/` | Private exported review decisions; ignored by Git |
+The 3080 is the intended quality target; this update needs no larger model or GPU.
+GX10 has a separate ARM/CUDA installation path. End-to-end GPU acceptance and
+measured accuracy benchmarks remain outstanding; installer checks must pass on
+your machine. Ollama is not used. See [hardware and troubleshooting](QUALITY_GUIDE.md#hardware-and-models).
 
-JSON is always generated; add `--review-formats json,srt,vtt` for subtitles.
-Default paths belong to the checkout, even when invoking the installed
-`transcribe-media` command from another directory. Passing another source folder
-alone still uses this checkout's output directories and voice registry.
-
-**Back up `Review/`, `speaker-decisions/`, original recordings and `Transcribed/`.**
-The registry, manifest and review packets belong together. Do not delete just the
-registry to fix duplicate people; use the merge workflow in the quality guide.
-Review application validates the original source, so keep its location/content
-unchanged while reviewing. Review audio adds approximately 115 MB per hour.
-Keep each review HTML beside its WAV if copying the review folder to a desktop.
-
-Updates use `git pull --ff-only`; rerun `./install.sh` when dependency or model
-requirements change. The 1.14 review update needs no reinstall. Ignored recordings
-and voice state are preserved. Program/model changes can require reprocessing;
-back up first. Versions before 1.12 required `--quality`; it is now automatic.
-Old automatic profiles remain candidates but need human-reviewed reference clips
-before the quality matcher trusts them. `--no-quality` explicitly restores the
-legacy batched transcription and automatic-enrollment behavior; it is also
-required for translation or disabling alignment/speaker identity.
-
-## Hardware and troubleshooting
-
-On an RTX 3080, ASR runs on CUDA while smaller analysis models run on CPU to keep
-VRAM available. Alignment can retry on CPU. The same large-v3 model can retry
-initialization with `int8_float16` if float16 runs out of memory; no smaller model
-is silently selected. Automatic-device processing can fall back to CPU, with the
-selected runtime reported; use `--device cuda` if you need it to fail instead.
-There is no larger-model quality tier that requires a GPU upgrade.
-
-| Problem | Next step |
-| --- | --- |
-| `401`, `403`, or gated-model download error | Accept Community-1 access with the token's account; run `./transcribe-media --configure`, then `./transcribe-media --prepare-models` online |
-| Missing weights/offline cache error | Run `./transcribe-media --prepare-models` online, using the same optional language/model/backend flags as the intended run |
-| CUDA error or unexpected CPU use | Run `nvidia-smi`, then `./transcribe-media --doctor --device cuda`; repair the driver/environment before retrying |
-| Too many uncertain speakers | Review clean clips from several recording conditions; use `--refresh-voices`; do not lower matching thresholds as the first fix |
-| Complete processing but draft transcript | Open the review page and resolve the remaining speaker assignments |
-
-**ASUS GX10 / GB10:** use the same installer on its DGX OS. It selects ARM64
-PyTorch CUDA 12.9 wheels and builds pinned CTranslate2 with CUDA locally. This
-needs a working driver and CUDA toolkit **12.8 or newer** at `/usr/local/cuda`
-(or set `TRANSCRIBE_CUDA_ROOT`). Apt installs the build prerequisites.
-`TRANSCRIBE_BUILD_JOBS` controls compilation parallelism (default 8). The installer
-does not install the driver/toolkit. Other ARM GPU architectures are not covered
-by this GB10 build path.
-
-The current release has CPU integration tests and GX10 preflight tests.
-**RTX 3080 and GX10 end-to-end hardware acceptance remains outstanding**;
-installer GPU inference checks are required on the target machine. No measured
-WER/DER or cross-session identity accuracy is claimed. More VRAM alone does not
-make profile matching more accurate. Ollama is not used; run this specialized
-speech pipeline directly on the GX10 if using that machine.
-
-## Privacy, limitations and development
-
-Normal processing uses local model caches. Setup/model preparation downloads
-weights; the launcher disables supported telemetry. Review pages contain local
-scripts and audio, with no hosted service. Treat recordings, review audio,
-transcripts, embeddings and decision exports as private data; default working
-directories and decision exports are ignored by Git.
-
-Short replies, noise and simultaneous speech remain difficult. This version
-labels speakers but does not extract separate audio tracks for overlapping
-voices; it downmixes input to mono. Verify consequential quotations and speaker
-attribution against the recording before downstream therapist analysis. The
-software performs no therapeutic interpretation or diagnosis.
-
-See [CONTRIBUTING.md](CONTRIBUTING.md) for tests and release validation and
-[CHANGELOG.md](CHANGELOG.md) for changes. Source is [MIT licensed](LICENSE);
-third-party packages and model weights retain their own licenses/access terms.
+See [QUALITY_GUIDE.md](QUALITY_GUIDE.md) for review details, profile repair, backups,
+advanced options and model limits; [CONTRIBUTING.md](CONTRIBUTING.md) for checks;
+and [CHANGELOG.md](CHANGELOG.md) for releases. Source is [MIT licensed](LICENSE);
+third-party models and packages retain their own licenses and access terms.

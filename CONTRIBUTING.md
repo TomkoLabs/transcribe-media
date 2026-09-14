@@ -18,18 +18,23 @@ TRANSCRIBE_TEST_PYTHON=python ./scripts/check.sh
 ```
 
 The OS also needs FFmpeg, ShellCheck and Node.js 18 or newer. Node is used only
-for review-state tests; normal installation and transcription do not need it.
+for review UI logic tests; normal installation and transcription do not need it.
 Tests use temporary directories,
 synthetic audio/embeddings and mocked model interfaces. They exercise CLI
 processing, first enrollment, speaker correction/merge/rematch, incremental
 reruns, cache integrity, state recovery, CUDA selection, and installer failures.
-The offline UI embeds `review_state.js`, `review_io.js` and `review_page.html` from the Python
-package. Run `node tests/test_review_state.cjs` for draft/import/clip-range tests.
-Use synthetic recordings for browser checks of filters, playback, labels and export.
+The offline UI in `review_page.html` embeds its CSS, controller, and the
+`review_state.js`, `review_io.js` and `review_playback.js` helpers from the Python
+package. Generated pages remain standalone, with sibling audio files.
+Run `node tests/test_review_state.cjs` for draft/import/range/playback logic tests.
+Use synthetic recordings for browser checks of filters, contextual playback,
+partial correction previews/playhead marking, labels and export.
 Batch tests cover shared enrollment, final rematching, UNKNOWN exclusions,
 alias recovery, relative decision paths and rollback of the whole batch. Browser
 folder-saving logic is tested with fake file handles; manually check the native
 folder picker in a supporting browser before claiming a specific browser is supported.
+Saved-export tests check that formatting updates preserve canonical JSON, speaker
+state and words without models or source media, and restore exports after failure.
 The GitHub Actions workflow runs the same checks in Debian 12 and 13 containers.
 GitLab CI is retained for the existing mirror.
 

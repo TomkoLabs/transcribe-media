@@ -1,5 +1,48 @@
 # Changelog
 
+## 1.14.2 — 2026-09-12
+
+- Removed repeated `[speaker attribution uncertain]` tags from primary transcripts
+  and shortened the introduction. Attribution diagnostics stay in detailed review
+  files, with one draft notice in the primary TXT for unresolved identities.
+- Confidence changes no longer split adjacent speech by the same person into
+  separate paragraphs. Speaker changes, long pauses and separate UNKNOWN turns
+  remain distinct. Pauses use actual timestamps even after speaker review removes
+  old acoustic annotations; recognized words and identity decisions are preserved.
+- Added `--render-transcripts` to update existing text/subtitle exports from
+  canonical JSON without inference, voice rematching or profile changes. It
+  validates saved results and rolls back the whole export batch on write failure.
+- Maintenance commands now reject conflicting actions and transcription-only
+  dry runs, avoiding silently ignored flags.
+
+Run `--render-transcripts` after updating to clean existing transcripts. Normal
+quality defaults, model choices and hardware requirements are unchanged. Tests
+cover rendering and recovery; target-GPU acceptance and measured accuracy remain
+outside this presentation update.
+
+## 1.14.1 — 2026-09-12
+
+- Listening adds 2 seconds of context on either side, or 4 seconds for uncertain
+  speech, with 5-second and exact-selection options. A live clock and target
+  highlight distinguish the selected speech from neighboring voices. Correction
+  and training intervals stay unchanged.
+- Partial corrections have preview, start/end-at-playhead controls and playback
+  for saved ranges. Guidance explains uncertain timing and word-based assignment.
+- Group completion follows reviewed spoken words, so silent gaps between clips
+  no longer keep fully assigned speech pending. Reference progress is separate;
+  applying a sample's person to remaining speech still requires explicit approval.
+- Download JSON is the primary save path, with clear project-folder/apply steps.
+  Optional direct saving detects unavailable APIs and handles browser denial or
+  cancellation without losing the draft.
+- Split the review template into maintainable source assets while still embedding
+  everything into one offline page. Shortened the README and moved detailed
+  hardware/troubleshooting instructions into the quality guide.
+
+Regenerate existing pages with `./transcribe-media --review-speakers` and reopen
+HTML. No reinstall, retranscription, new model or additional GPU requirement.
+Synthetic workflow/browser checks do not establish model accuracy or target-GPU
+performance; hardware acceptance remains pending.
+
 ## 1.14.0 — 2026-09-11
 
 - Aggregated offline review across all processed recordings, with one shared

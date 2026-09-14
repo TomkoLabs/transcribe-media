@@ -23,7 +23,6 @@ Community-1 plus Sortformer as a second opinion. Community-1 alone is available
 with `--diarization-backend pyannote`. Token-free SpeechBrain clustering is a
 weaker baseline for speaker changes and overlap. Check the actual backend in
 the run output and JSON.
-The included development sample is not a labeled evaluation corpus.
 
 Quality mode keeps large-v3 unless you explicitly choose another model. It uses
 the full faster-whisper sequential decoder with temperature fallback for low
@@ -66,9 +65,10 @@ decisions on the machine holding the original project and recordings.
    An acoustic outlier or model-disputed clip is initially unchecked but can be explicitly selected
    after assigning it to its actual speaker. A window spanning different
    reviewed identities is excluded from reference training.
-5. Click **Save to project** and select the project folder. Supported browsers
-   write into `speaker-decisions/`. Alternatively, **Download JSON** and move the
-   file there yourself. Click **Copy apply command** and run it from the project:
+5. Click **Download JSON**, move the downloaded file into `speaker-decisions/`
+   without renaming it, then **Copy apply command** and run it from the project.
+   **Apply command & optional folder saving** offers direct folder saving in
+   compatible browsers. If permission is blocked, use the download workflow:
 
 ```bash
 ./transcribe-media --apply-speaker-review "speaker-decisions/batch-REPLACE_WITH_EXPORTED_ID.decisions.json"
@@ -94,6 +94,13 @@ the transcript is labeled `DRAFT: SPEAKER REVIEW REQUIRED`, and the manifest rec
 error that should repeatedly run ASR. A weak or unknown voice stays unresolved
 instead of being forced onto an adult profile. Human approval identifies who
 spoke; it does not certify ASR wording or eliminate acoustic overlap uncertainty.
+
+Readable transcripts use plain speaker headings without repeating attribution
+warnings on individual paragraphs. Adjacent speech by the same identified person
+can share a paragraph even if model confidence differs. Speaker changes, long
+pauses and separate UNKNOWN turns remain distinct. Detailed TXT/JSON and the
+review page retain attribution diagnostics; the primary TXT keeps one draft
+notice when speaker assignments still need review.
 
 A new person can be saved **with no usable reference audio**. Their transcript
 label is valid independently of whether the voice profile can identify them
@@ -121,6 +128,31 @@ pools. It does not stitch audio. Query-evidence, score, margin, child-role and
 agreement checks still apply. Shorter speech can be labeled, but cannot serve
 as a reference. Nonverbal vocalizations are not guaranteed to be transcribed.
 
+### Listen around uncertain speech
+
+**Listen** includes two seconds before and after the target, or four seconds
+when timing, overlap or reference evidence is uncertain. Choose **5s each side**
+for more context, or **Exact selection only** to hear the original interval.
+Playback stops after the surrounding context. The clock and status distinguish
+**Before target**, **Target** and **After target**; the selected card's outline
+turns green during the target. Nearby voices are context only: the selected
+speaker, correction interval and training audio do not expand with playback.
+
+Under **All soundbites → Correct part of this soundbite**, use **Preview selection**
+to audition the start/end values. Listen and pause near a speaker change, then
+use **Start at playhead** or **End at playhead**, or type seconds. Choose a person
+and click **Set time correction**. Saved corrections also have a Listen button.
+Marking or previewing alone does not apply a correction. Boundaries must remain
+inside the soundbite; word midpoints determine which words change speaker.
+Wider playback helps locate speech, but does not repair inaccurate word alignment.
+
+Groups become **Chosen by you** when all their spoken words have explicit choices;
+small unassigned pauses or trimmed clip edges do not hold the group pending.
+Reference-clip progress is shown separately: reviewing every sampled clip may
+still leave other words unassigned. When all samples have the same person, use
+**Assign remaining speech to …** after checking for exceptions. This is an
+explicit whole-group confirmation; sample labels are never silently propagated.
+
 ### Save drafts and manage people
 
 **Import saved review** restores an exported decisions JSON before it has been
@@ -133,8 +165,10 @@ be imported into the batch page; other recordings keep their choices.
 The page stays fully offline: saving/importing decisions cannot directly write transcript or
 registry files. Applying through the copied command keeps the workflow to one
 HTML page and one command, without installing or securing a local web service.
-Folder saving requires the browser's File System Access API and your explicit
-folder selection; unsupported browsers use the download-and-move fallback.
+Direct folder saving is optional. It requires the browser's File System Access
+API and your explicit folder selection; browser restrictions can still block it.
+The page hides the option when unsupported or denied and explains the
+download-and-move workflow. Cancelling folder selection leaves your draft intact.
 The copied command always uses `speaker-decisions/` relative to the project root.
 The script also resolves that folder against its installed project when invoked
 from another working directory. No Downloads location is assumed.
@@ -254,6 +288,15 @@ failed decisions exports can be retried directly when their source is unchanged.
 Newly extracted short/disputed reference windows require processing the recording
 again; the review update cannot recover embeddings absent from an old packet.
 
+For presentation changes alone, run `./transcribe-media --render-transcripts`.
+It regenerates the registered TXT/detailed TXT/subtitle exports from saved JSON,
+without rematching speakers, running ASR, learning references or changing JSON
+and processing state. Original media and model weights are not needed. It also
+preserves existing acoustic/tone annotations. Export files are replaced, so keep
+any hand-edited TXT copies separately. Missing/invalid canonical JSON stops the
+operation, and write failures roll back all exports. Use `--refresh-voices`
+instead when you intend to change automatic matches using improved references.
+
 Processing, review application and merging use one project lock and a recoverable
 journal for the registry, manifest and transcript outputs. After interruption,
 the next command restores the prior state before proceeding. Files are written
@@ -263,12 +306,36 @@ are independent of voice matching policy; `--overwrite` forces fresh ASR.
 
 ## Hardware and models
 
-No larger GPU is required by this quality preset. It retains the existing
-RTX 3080 policy: ASR on CUDA, other models on CPU for constrained VRAM, with the
-same-model compute fallback. The full decoding fallback may take longer. A GX10's
-larger memory allows more analysis work on CUDA under the existing runtime policy.
-GPU hardware validation remains pending; the ARM build path and required target
-machine checks are documented in the README and contributing guide.
+On an RTX 3080, ASR runs on CUDA while smaller analysis models run on CPU to keep
+VRAM available. Alignment can retry on CPU. The same large-v3 model can retry
+initialization with `int8_float16` if float16 runs out of memory; no smaller model
+is silently selected. Automatic-device processing can fall back to CPU, with the
+selected runtime reported; use `--device cuda` if you need it to fail instead.
+There is no larger-model quality tier that requires a GPU upgrade.
+
+| Problem | Next step |
+| --- | --- |
+| `401`, `403`, or gated-model download error | Accept Community-1 access with the token's account; run `./transcribe-media --configure`, then `./transcribe-media --prepare-models` online |
+| Missing weights/offline cache error | Run `./transcribe-media --prepare-models` online, using the same optional language/model/backend flags as the intended run |
+| CUDA error or unexpected CPU use | Run `nvidia-smi`, then `./transcribe-media --doctor --device cuda`; repair the driver/environment before retrying |
+| Too many uncertain speakers | Review clean clips from several recording conditions; use `--refresh-voices`; do not lower matching thresholds as the first fix |
+| Complete processing but draft transcript | Open the review page and resolve the remaining speaker assignments |
+
+**ASUS GX10 / GB10:** use the same installer on its DGX OS. It selects ARM64
+PyTorch CUDA 12.9 wheels and builds pinned CTranslate2 with CUDA locally. This
+needs a working driver and CUDA toolkit **12.8 or newer** at `/usr/local/cuda`
+(or set `TRANSCRIBE_CUDA_ROOT`). Apt installs the build prerequisites.
+`TRANSCRIBE_BUILD_JOBS` controls compilation parallelism (default 8). The installer
+does not install the driver/toolkit. Other ARM GPU architectures are not covered
+by this GB10 build path.
+
+The current release has CPU integration tests and GX10 preflight tests.
+**RTX 3080 and GX10 end-to-end hardware acceptance remains outstanding**;
+installer GPU inference checks are required on the target machine. No measured
+WER/DER or cross-session identity accuracy is claimed. More VRAM alone does not
+make profile matching more accurate. Ollama is not used; run this specialized
+speech pipeline directly on the GX10 if using that machine.
+
 
 Whisper large has 1.55 billion parameters; speaker encoders are much smaller.
 The original Whisper project's memory table is not an exact memory measurement
@@ -304,8 +371,9 @@ cross-recording identity improvements remain unvalidated.
 
 ## TL;DR
 
-Run `./transcribe-media`, confirm the first profiles in the local review page, apply the
-exported decisions, then use `--refresh-voices` to reduce the remaining queue.
+Run `./transcribe-media` on all recordings, review uncertain voices in the batch
+page, download the decisions into `speaker-decisions/`, and run the copied apply
+command. Batch application also refreshes cached speaker matches.
 Collect verified clips across sessions and inspect held-out evaluation results.
 Use `--no-speaker-learning` once the references are satisfactory. Keep
 uncertain child/overlap speech unresolved until reviewed; never force two speakers

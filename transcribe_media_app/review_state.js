@@ -80,16 +80,22 @@
       }
     }
     groupChoice(local) { return this.assignments[local] || this.machine[local] || ''; }
-    choiceAt(turn, at) {
-      return this.ranges.find(r=>r.turn_id===turn.id && r.start <= at && at < r.end)?.profile ||
-        this.overrides[turn.id] || this.groupChoice(turn.local_speaker || turn.speaker);
+    choiceAt(turn, at, humanOnly=false) {
+      return this.ranges.find(r=>r.turn_id===turn.id && r.start <= at &&
+        (at < r.end || at===turn.end && r.end===turn.end))?.profile ||
+        this.overrides[turn.id] || (humanOnly?this.assignments[turn.local_speaker || turn.speaker]||'':this.groupChoice(turn.local_speaker || turn.speaker));
     }
-    clipChoices(local,start,end) {
+    spokenChoices(turn, humanOnly=false) {
+      const units=turn.words?.length?turn.words:[turn];
+      return [...new Set(units.map(unit=>Number.isFinite(unit.start)&&Number.isFinite(unit.end)?
+        this.choiceAt(turn,(unit.start+unit.end)/2,humanOnly):''))];
+    }
+    clipChoices(local,start,end,humanOnly=false) {
       const values = new Set();
       for (const turn of this.data.turns.filter(t=>(t.local_speaker||t.speaker)===local && t.start < end && t.end > start)) {
         const bounds = [...new Set([Math.max(start,turn.start),Math.min(end,turn.end),
           ...this.ranges.filter(r=>r.turn_id===turn.id).flatMap(r=>[r.start,r.end]).filter(t=>t>Math.max(start,turn.start)&&t<Math.min(end,turn.end))])].sort((a,b)=>a-b);
-        for(let i=1;i<bounds.length;i++) values.add(this.choiceAt(turn,(bounds[i-1]+bounds[i])/2));
+        for(let i=1;i<bounds.length;i++) values.add(this.choiceAt(turn,(bounds[i-1]+bounds[i])/2,humanOnly));
       }
       return [...values];
     }
@@ -123,7 +129,7 @@
     }
     status(local) {
       const turns=this.data.turns.filter(t=>(t.local_speaker||t.speaker)===local);
-      const values=turns.flatMap(t=>this.clipChoices(local,t.start,t.end));
+      const values=turns.flatMap(t=>this.spokenChoices(t));
       if(values.some(v=>!v||v==='unknown')) return 'pending';
       if(this.assignments[local] || turns.some(t=>this.overrides[t.id] || this.ranges.some(r=>r.turn_id===t.id))) return 'reviewed';
       return this.machine[local] ? 'matched' : 'pending';
@@ -132,8 +138,17 @@
       if(this.status(local)==='pending')return true;
       if(this.assignments[local])return false;
       return this.data.turns.some(t=>(t.local_speaker||t.speaker)===local &&
-        t.speaker_attribution?.status==='uncertain' && !this.overrides[t.id] &&
-        this.ranges.filter(r=>r.turn_id===t.id).reduce((sum,r)=>sum+r.end-r.start,0)<t.end-t.start-1e-6);
+        t.speaker_attribution?.status==='uncertain' && this.spokenChoices(t,true).some(choice=>!choice||choice==='unknown'));
+    }
+    referenceProgress(local) {
+      const clips=this.data.windows[local]||[];
+      const reviewed=clips.filter(clip=>{
+        const values=this.clipChoices(local,clip.start,clip.end,true);
+        return values.length && values.every(choice=>choice&&choice!=='unknown');
+      });
+      const people=new Set(reviewed.flatMap(clip=>this.clipChoices(local,clip.start,clip.end,true)));
+      return {reviewed:reviewed.length,total:clips.length,
+        person:reviewed.length===clips.length&&clips.length&&people.size===1?[...people][0]:null};
     }
     export() {
       return {format_version:2, review_id:this.data.review_id, packet:this.data.packet,

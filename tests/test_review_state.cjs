@@ -4,6 +4,7 @@ const fs=require('node:fs');
 const vm=require('node:vm');
 const {ReviewDraft,ReviewWorkspace}=require('../transcribe_media_app/review_state.js');
 const ReviewIO=require('../transcribe_media_app/review_io.js');
+const ReviewPlayback=require('../transcribe_media_app/review_playback.js');
 const make=()=>({review_id:'review-1',packet:'packet.json',source:'synthetic.wav',
   profiles:[{voice_id:'VOICE_0001',label:'Alex',role:'adult',verified_sessions:2}],
   matches:[{local_speaker:'A',speaker:'VOICE_0001',status:'matched',similarity:.92},
@@ -56,6 +57,7 @@ test('all inline review scripts parse without external dependencies',()=>{
   const html=fs.readFileSync('transcribe_media_app/review_page.html','utf8');
   for(const match of html.matchAll(/<script>([\s\S]*?)<\/script>/g)) new vm.Script(match[1]);
   assert.equal(/<script[^>]+src=/.test(html),false);
+  new vm.Script(fs.readFileSync('transcribe_media_app/review_page.js','utf8'));
 });
 
 const makeBatch=()=>{const first=make(),second={...make(),review_id:'review-2',packet:'second.json',source:'second.wav'};
@@ -124,4 +126,54 @@ test('folder saving validates the project and writes the exact relative destinat
   assert.equal(path,'speaker-decisions/batch-123.decisions.json');assert.deepEqual(JSON.parse(content),{example:true});
   assert.deepEqual(calls,['transcribe-media',['transcribe_media_app',undefined],['speaker-decisions',{create:true}],['batch-123.decisions.json',{create:true}],'close']);
   await assert.rejects(()=>ReviewIO.writeToProject({getFileHandle:async()=>{throw Error('Wrong folder');}},'batch-123.decisions.json',{}));
+});
+test('listening context is clamped to the audio while keeping target boundaries',()=>{
+  assert.deepEqual(ReviewPlayback.bounds(1,3,10,2),{start:0,end:5,targetStart:1,targetEnd:3});
+  assert.deepEqual(ReviewPlayback.bounds(8,10,10,4),{start:4,end:10,targetStart:8,targetEnd:10});
+  assert.equal(ReviewPlayback.padding('auto',false),2);assert.equal(ReviewPlayback.padding('auto',true),4);
+  assert.equal(ReviewPlayback.padding('exact',true),0);assert.equal(ReviewPlayback.padding('wide',false),5);
+  assert.throws(()=>ReviewPlayback.bounds(4,2,10,2));assert.throws(()=>ReviewPlayback.bounds(11,12,10,2));
+});
+test('playback distinguishes target speech from neighboring voices without changing decisions',()=>{
+  const d=new ReviewDraft(make()),before=d.export();const range=ReviewPlayback.bounds(2,4,10,2);
+  assert.match(ReviewPlayback.phase(1,range),/Before target/);
+  assert.match(ReviewPlayback.phase(2,range),/^Target/);
+  assert.match(ReviewPlayback.phase(4,range),/After target/);
+  assert.deepEqual(d.export(),before);
+});
+test('playhead marks stay inside the correction turn and preserve start-before-end',()=>{
+  const turn={start:10,end:20};assert.equal(ReviewPlayback.mark(12.3456,turn,18,'start'),12.346);
+  assert.throws(()=>ReviewPlayback.mark(9,turn,18,'start'));
+  assert.throws(()=>ReviewPlayback.mark(19,turn,18,'start'));
+  assert.throws(()=>ReviewPlayback.mark(12,turn,14,'end'));
+});
+test('all spoken words reviewed marks the group chosen even when silence is unassigned',()=>{
+  const data=make();data.matches=[];data.turns[1].words=[{start:7,end:8},{start:10,end:11}];
+  const d=new ReviewDraft(data);d.setRange('b',7.1,7.9,'VOICE_0001');d.setRange('b',10.1,10.9,'VOICE_0001');
+  assert.equal(d.status('B'),'reviewed');assert.equal(d.groupChoice('B'),'');
+  assert.deepEqual(d.export().assignments,{}); // No implicit assignment of other speech.
+});
+test('assigned samples alone never verify unreviewed words in the rest of a group',()=>{
+  const data=make();data.turns[1].words=[{start:7,end:8},{start:10,end:11}];
+  const d=new ReviewDraft(data);d.setClip('B',7,9,'VOICE_0001');
+  assert.deepEqual(d.referenceProgress('B'),{reviewed:1,total:1,person:'VOICE_0001'});
+  assert.equal(d.status('B'),'pending');
+});
+test('folder denial produces a clear manual fallback and cancellation remains harmless',()=>{
+  assert.equal(ReviewIO.folderSupport({isSecureContext:false,showDirectoryPicker(){}}),false);
+  assert.equal(ReviewIO.folderSupport({isSecureContext:true}),false);
+  assert.equal(ReviewIO.folderSupport({isSecureContext:true,showDirectoryPicker(){}}),true);
+  for(const name of ['NotAllowedError','SecurityError']){
+    const result=ReviewIO.folderFailure({name});assert.equal(result.blocked,true);assert.match(result.text,/Download JSON/);
+  }
+  assert.equal(ReviewIO.folderFailure({name:'AbortError'}).blocked,false);
+});
+test('final zero-duration words and shared correction boundaries remain reviewable',()=>{
+  const data=make();data.turns[1].words=[{start:8,end:10},{start:12,end:12}];
+  const d=new ReviewDraft(data);d.setRange('b',7,9,'new:Child');d.setRange('b',9,12,'VOICE_0001');
+  assert.deepEqual(d.spokenChoices(data.turns[1]),['VOICE_0001']);assert.equal(d.status('B'),'reviewed');
+});
+test('missing word timing is not silently treated as reviewed speech',()=>{
+  const data=make();data.turns[1].words=[{start:null,end:null}];
+  const d=new ReviewDraft(data);d.assignments.B='VOICE_0001';assert.equal(d.status('B'),'pending');
 });

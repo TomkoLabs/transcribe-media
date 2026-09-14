@@ -249,9 +249,45 @@ class FormattingTests(unittest.TestCase):
         self.assertIn("[Context: elevated volume]", text)
         self.assertNotIn("fast speech", text)
         self.assertIn("[Vocal tone estimate: angry]", text)
-        self.assertIn("VOICE_0002 [speaker attribution uncertain]:", text)
+        self.assertIn("VOICE_0002:\nI know.", text)
+        self.assertNotIn("speaker attribution uncertain", text)
         self.assertIn("[Context: overlapping speech]", text)
         self.assertNotIn("Vocal tone estimate: neutral", text)
+
+    def test_confidence_changes_do_not_break_same_speaker_paragraphs(self):
+        payload = {
+            "source": {"relative_path": "session.wav"}, "language": {"output": "en"},
+            "turns": [
+                {"speaker": "VOICE_0001", "text": "First sentence.",
+                 "speaker_attribution": {"status": "assigned"}},
+                {"speaker": "VOICE_0001", "text": "Second sentence.",
+                 "speaker_attribution": {"status": "uncertain"}},
+                {"speaker": "VOICE_0002", "text": "A reply."},
+                {"speaker": "VOICE_0001", "text": "After the reply.", "start": 4., "end": 5.},
+                {"speaker": "VOICE_0001", "text": "After a gap in reviewed audio.", "start": 8., "end": 9.},
+                {"speaker": "VOICE_0001", "text": "After a long pause.", "pause_before_seconds": 3.},
+            ],
+        }
+        text = render_txt(payload)
+        self.assertIn("VOICE_0001:\nFirst sentence. Second sentence.", text)
+        self.assertEqual(text.count("VOICE_0001:"), 4)
+        self.assertLess(text.index("A reply."), text.index("After the reply."))
+        self.assertEqual(payload['turns'][1]['speaker_attribution']['status'], 'uncertain')
+
+    def test_unknown_turns_stay_distinct_and_pending_review_is_shown_once(self):
+        payload = {
+            "source": {"relative_path": "session.wav"}, "language": {"output": "en"},
+            "speaker_review": {"pending": ["A"]},
+            "turns": [{"speaker": "SPEAKER_UNKNOWN", "text": text,
+                       "speaker_attribution": {"status": "uncertain"}}
+                      for text in ("One anonymous turn.", "Another anonymous turn.")],
+        }
+        text = render_txt(payload)
+        self.assertEqual(text.count("UNKNOWN:"), 2)
+        self.assertIn("Speakers: UNKNOWN", text)
+        self.assertNotIn("SPEAKER_UNKNOWN", text)
+        self.assertEqual(text.count("DRAFT: SPEAKER REVIEW REQUIRED"), 1)
+        self.assertNotIn("speaker attribution uncertain", text)
 
     def test_condensed_tone_reports_strong_temporal_change_without_scores(self):
         payload = {
