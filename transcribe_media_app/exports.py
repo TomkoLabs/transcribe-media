@@ -6,7 +6,7 @@ from pathlib import Path
 
 from .renderers import write_outputs
 from .schema import MANIFEST_SCHEMA_VERSION, RESULT_SCHEMA_VERSION
-from .storage import StateTransaction
+from .storage import StateTransaction, ManifestStore
 
 
 def render_saved_transcripts(review_dir: Path) -> dict[str, int]:
@@ -14,7 +14,8 @@ def render_saved_transcripts(review_dir: Path) -> dict[str, int]:
 
     JSON, review decisions, profile evidence and processing state are read-only.
     Validate every saved result first; any write failure restores all exports.
-    Original recordings and model weights are unnecessary for this operation.
+    No model weights are needed. When a review packet exists, verify its source;
+    unavailable or changed media makes the regenerated presentation DRAFT.
     """
     review_dir = Path(review_dir)
     manifest_path = review_dir / "transcription_manifest.json"
@@ -46,6 +47,13 @@ def render_saved_transcripts(review_dir: Path) -> dict[str, int]:
                 or any(not isinstance(payload.get(key), dict) for key in ("source", "language", "processing"))
                 or not isinstance(payload.get("turns"), list)):
             raise ValueError(f"invalid or unsupported saved transcript JSON for {source}")
+        from .review import packet_path
+        from .recovery import inspect_packet
+        packet_file = packet_path(review_dir, source)
+        if packet_file.exists():
+            status = inspect_packet(packet_file, manifest=ManifestStore(manifest_path))
+            if not status['decisions_allowed']:
+                payload.setdefault('speaker_review', {})['source_status'] = status['state']
         files = {key: Path(path) for key, path in outputs.items() if key != "json"}
         if set(files) - {"txt", "detailed_txt", "srt", "vtt"}:
             raise ValueError(f"unsupported saved output format for {source}")

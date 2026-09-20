@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any
 
 from . import __version__
+from .evidence import identity_evidence_summary
 from .storage import stable_hash, utc_now
 
 SPEAKER_REGISTRY_SCHEMA_VERSION = "1.0"
@@ -324,6 +325,32 @@ class VoiceRegistry:
                                     ("collecting" if any(obs.get("verified") for obs in item["observations"]) else "untrained")}
                 for key, item in sorted(data["profiles"].items())]
 
+    def review_window_candidates(self, evidence):
+        """Read-only alternatives based on verified references, never new training."""
+        with self._locked():
+            data = self._load_unlocked()
+        profiles = {key: p for key, p in data['profiles'].items()
+                    if not p.get('archived') and self._reference_conditions(p)}
+        rankings = self._reviewed_rankings(profiles, [w['embedding'] for item in evidence.values()
+                                                    for w in item.get('windows', [])])
+        output = {}
+        for local, item in evidence.items():
+            output[local] = []
+            for window in item.get('windows', []):
+                scores = [(score, key) for key, score in rankings[tuple(window['embedding'])]]
+                candidates = [{'speaker': key, 'similarity': round(score, 4),
+                               'score_kind': 'verified_reference_similarity'}
+                              for score, key in scores[:3] if score >= 0]
+                suggested = None
+                if candidates:
+                    best = candidates[0]
+                    runner = candidates[1]['similarity'] if len(candidates) > 1 else -1.
+                    threshold = .85 if profiles[best['speaker']].get('role') == 'child' else .80
+                    if best['similarity'] >= threshold and best['similarity'] - runner >= .20:
+                        suggested = best['speaker']
+                output[local].append({'candidates': candidates, 'suggested_speaker': suggested})
+        return output
+
     def reviewed_profile_ids(self, receipts):
         """Recover draft IDs from older review receipts, including later merges."""
         with self._locked():
@@ -374,6 +401,30 @@ class VoiceRegistry:
             support = sorted((cosine_similarity(embedding, vector) for vector in vectors), reverse=True)
             scores.append(min(cosine_similarity(embedding, _centroid(vectors)), support[1]))
         return max(scores, default=-1.0)
+
+    @staticmethod
+    def _reviewed_rankings(profiles, embeddings):
+        """Batch the existing consensus calculation as the reference library grows."""
+        import numpy as np
+        unique = list(dict.fromkeys(tuple(vector) for vector in embeddings))
+        if not unique:
+            return {}
+        # Match cosine_similarity's seven-decimal normalization exactly.
+        queries = np.asarray([_normalize(vector) for vector in unique], dtype=np.float64)
+        scores = {key: np.full(len(unique), -1.) for key in profiles}
+        for key, profile in profiles.items():
+            if profile.get('archived'):
+                continue
+            for vectors in VoiceRegistry._reference_conditions(profile):
+                references = np.asarray([_normalize(vector) for vector in vectors], dtype=np.float64)
+                if references.shape[1] != queries.shape[1]:
+                    raise SpeakerRegistryError('speaker embedding dimensions do not match')
+                support = queries @ references.T
+                second = np.partition(support, -2, axis=1)[:, -2]
+                center = np.asarray(_normalize(_centroid(vectors)), dtype=np.float64)
+                scores[key] = np.maximum(scores[key], np.minimum(queries @ center, second))
+        return {vector: sorted(((key, float(values[i])) for key, values in scores.items()),
+                               key=lambda pair: pair[1], reverse=True) for i, vector in enumerate(unique)}
 
     def confirm_references(self, references, new_profiles=None, review_id=None, replace_source_fingerprint=None,
                            profile_updates=None):
@@ -761,7 +812,7 @@ class VoiceRegistry:
         return {
             "embedding": embedding,
             "windows": [window for item in items for window in item.get("windows", [])],
-            "suspected_mixed_speakers": any(item.get("suspected_mixed_speakers") for item in items),
+            "suspected_mixed_speakers": any(identity_evidence_summary(item)['mixed_voice_evidence'] for item in items),
             "clean_seconds": sum(_number(item.get("clean_seconds")) for item in items),
             "available_clean_seconds": sum(
                 _number(item.get("available_clean_seconds")) for item in items
@@ -827,61 +878,89 @@ class VoiceRegistry:
                 group: self._group_evidence(group, usable, local_similarities)
                 for group in groups
             }
+            rankings = self._reviewed_rankings({key: profiles[key] for key in profile_ids}, [vector for item in grouped_evidence.values() if item
+                for vector in [item['embedding'], *(w['embedding'] for w in item.get('windows', []))]]) if self.reviewed else {}
             scored: dict[tuple[str, ...], list[tuple[str, float]]] = {}
+            diagnostics = {}
             for group, item in grouped_evidence.items():
+                blockers = []
+                diagnostics[group] = {'blockers': blockers}
                 if item is None or not self._eligible_for_match(item):
+                    blockers.append('insufficient_query_audio')
                     continue
-                scored[group] = sorted(
-                    (
-                        (
-                            voice_id,
-                            self.profile_similarity(profiles[voice_id], item["embedding"], self.reviewed),
-                        )
-                        for voice_id in profile_ids
-                    ),
-                    key=lambda pair: pair[1],
-                    reverse=True,
-                )
+                scored[group] = (rankings[tuple(item['embedding'])] if self.reviewed else sorted(
+                    ((voice_id, self.profile_similarity(profiles[voice_id], item['embedding']))
+                     for voice_id in profile_ids), key=lambda pair: pair[1], reverse=True))
 
             proposals: list[tuple[float, tuple[str, ...], str, float]] = []
             for group, candidates in scored.items():
                 if not candidates:
+                    diagnostics[group]['blockers'].append('no_verified_profiles')
                     continue
                 voice_id, score = candidates[0]
                 runner_up = candidates[1][1] if len(candidates) > 1 else -1.0
                 margin = score - runner_up
                 threshold = max(self.match_threshold, 0.70 if self.reviewed else -1.)
                 required_margin = max(self.match_margin, 0.15 if self.reviewed else 0.)
-                reliable = True
+                diagnostic = diagnostics[group]
+                if self.reviewed and profiles[voice_id].get('role') == 'child':
+                    threshold = max(threshold, .78)
                 if self.reviewed:
                     item = grouped_evidence[group]
-                    windows = [window for window in item.get("windows", []) if window.get("retained", True)]
+                    windows = [window for window in item.get('windows', [])
+                               if window.get('retained', True) and not window.get('model_disagreement')]
                     votes = 0
                     for window in windows:
-                        window_scores = sorted((self.profile_similarity(profiles[key], window["embedding"], True), key)
-                                               for key in profile_ids)
-                        best_window, winner = window_scores[-1]
-                        second_window = window_scores[-2][0] if len(window_scores) > 1 else -1.
+                        window_scores = rankings[tuple(window['embedding'])]
+                        winner, best_window = window_scores[0]
+                        second_window = window_scores[1][1] if len(window_scores) > 1 else -1.
                         votes += winner == voice_id and best_window >= threshold and best_window - second_window >= required_margin
-                    reliable = bool(len(windows) >= 2 and votes / len(windows) >= 0.8
-                                    and not item.get("suspected_mixed_speakers"))
-                    if profiles[voice_id].get("role") == "child":
-                        threshold = max(threshold, 0.78)
-                if reliable and score >= threshold and margin >= required_margin:
+                    diagnostic.update(supporting_windows=votes, compared_windows=len(windows),
+                                      **identity_evidence_summary(item))
+                    if len(windows) < 2:
+                        diagnostic['blockers'].append('insufficient_independent_windows')
+                    elif votes / len(windows) < .8:
+                        diagnostic['blockers'].append('inconsistent_window_matches')
+                    if item.get('suspected_mixed_speakers'):
+                        diagnostic['blockers'].append('mixed_voice_evidence')
+                    if diagnostic['model_disputed_windows']:
+                        # Resolve a false mixed flag only when verified voices
+                        # support the group across the disputed samples too.
+                        # Other/unknown voices in those samples still block it.
+                        all_windows = item.get('windows', [])
+                        all_votes = 0
+                        for window in all_windows:
+                            ranked = rankings[tuple(window['embedding'])]
+                            winner, value = ranked[0]
+                            second = ranked[1][1] if len(ranked) > 1 else -1.
+                            all_votes += winner == voice_id and value >= threshold and value - second >= required_margin
+                        diagnostic.update(all_sample_support=all_votes, all_sample_count=len(all_windows))
+                        if all_votes / len(all_windows) < .8:
+                            diagnostic['blockers'].append('unresolved_disputed_voice_evidence')
+                diagnostic.update(best_candidate_speaker=voice_id, similarity=round(score, 4),
+                                  margin=round(margin, 4), required_similarity=threshold,
+                                  score_kind='verified_condition_consensus' if self.reviewed else 'centroid_cosine',
+                                  required_margin=required_margin)
+                if score < threshold:
+                    diagnostic['blockers'].append('insufficient_verified_reference_match')
+                if margin < required_margin:
+                    diagnostic['blockers'].append('ambiguous_profile_match')
+                if not diagnostic['blockers']:
                     proposals.append((score, group, voice_id, margin))
 
             group_assignments: dict[tuple[str, ...], dict[str, Any]] = {}
-            used_profiles: set[str] = set()
             for score, group, voice_id, margin in sorted(proposals, reverse=True):
-                if group in group_assignments or voice_id in used_profiles:
+                if group in group_assignments:
                     continue
-                group_assignments[group] = {
-                    "speaker": voice_id,
-                    "status": "matched",
-                    "similarity": round(score, 4),
-                    "margin": round(margin, 4),
-                }
-                used_profiles.add(voice_id)
+                prior = [other for other, choice in group_assignments.items() if choice['speaker'] == voice_id]
+                # Known people can recur in multiple clusters. Simultaneous
+                # clusters cannot become the same person automatically.
+                if prior and (not self.reviewed or any(frozenset((left, right)) in incompatible
+                            for other in prior for left in group for right in other)):
+                    diagnostics[group]['blockers'].append('overlap_with_same_profile' if self.reviewed else 'profile_already_assigned')
+                    continue
+                group_assignments[group] = {'speaker': voice_id, 'status': 'matched',
+                    'similarity': round(score, 4), 'margin': round(margin, 4)}
 
             dirty = not existed and self.learn
             new_voice_ceiling = self.match_threshold - self.match_margin / 2.0
@@ -1008,6 +1087,10 @@ class VoiceRegistry:
                     "reconciled_local_speakers": list(group),
                     "local_cluster_similarity": group_report["minimum_similarity"],
                     "candidates": candidate_report,
+                    "reference_candidates": [{"speaker": key, "similarity": round(value, 4),
+                                               "score_kind": "verified_condition_consensus"}
+                                              for key, value in (scored.get(group) or [])[:3] if value >= 0] if self.reviewed else [],
+                    "matching_diagnostics": diagnostics[group],
                 }
 
         matches = []
@@ -1033,7 +1116,7 @@ class VoiceRegistry:
         active_speaker_ids = sorted(
             {str(decision["speaker"]) for decision in assignments.values()}
         )
-        if len(active_speaker_ids) != len(groups):
+        if not self.reviewed and len(active_speaker_ids) != len(groups):
             raise SpeakerRegistryError(
                 "whole-recording identity reconciliation produced an inconsistent "
                 "active speaker set"

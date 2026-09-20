@@ -109,7 +109,7 @@ test('explicit unknown stays distinct from an unresolved review',()=>{
 });
 test('batch navigation includes uncertain timing until the affected turn is reviewed',()=>{
   const data=make();data.turns[0].speaker_attribution={status:'uncertain'};
-  const d=new ReviewDraft(data);assert.equal(d.status('A'),'matched');assert.equal(d.needsAttention('A'),true);
+  const d=new ReviewDraft(data);assert.equal(d.status('A'),'pending');assert.equal(d.needsAttention('A'),true);
   d.setRange('a',0,1,'ignore');assert.equal(d.needsAttention('A'),true);
   d.setRange('a',1,6,'VOICE_0001');assert.equal(d.needsAttention('A'),false);
 });
@@ -176,4 +176,41 @@ test('final zero-duration words and shared correction boundaries remain reviewab
 test('missing word timing is not silently treated as reviewed speech',()=>{
   const data=make();data.turns[1].words=[{start:null,end:null}];
   const d=new ReviewDraft(data);d.assignments.B='VOICE_0001';assert.equal(d.status('B'),'pending');
+  d.overrides.b='VOICE_0001';assert.equal(d.status('B'),'reviewed');
+});
+test('group assignment protects flagged exceptions and retains existing corrections',()=>{
+  const data=make();data.turns.push({id:'c',speaker:'B',start:13,end:17,text:'Possible child',review_reasons:['voice_reference_outlier']});
+  const d=new ReviewDraft(data);d.assignGroup('B','VOICE_0001');
+  assert.equal(d.choiceAt(data.turns[1],8),'VOICE_0001');assert.equal(d.choiceAt(data.turns[2],14),'unknown');
+  assert.deepEqual(d.pendingTurns().map(t=>t.id),['c']);
+  d.overrides.c='new:Child';d.assignGroup('B','VOICE_0001');assert.equal(d.choiceAt(data.turns[2],14),'new:Child');
+});
+test('reference excerpts contain only full timed words, never a whole untimed sentence',()=>{
+  const turns=[{text:'This whole sentence is not in the clip',words:[{text:'inside',start:3,end:4},{text:'outside',start:4,end:7},{text:'missing',start:null,end:null}]}];
+  assert.deepEqual(ReviewPlayback.clipText(turns,2,5),{text:'inside',partial:1});
+  assert.equal(ReviewPlayback.clipText([{text:'untimed sentence'}],2,5).text,'');
+});
+test('clean confident turns stay automatic and never become training approval on export',()=>{
+  const data=make();data.turns[0].review_reasons=[];
+  const d=new ReviewDraft(data);assert.equal(d.turnNeedsAttention(data.turns[0]),false);
+  assert.equal(d.choiceAt(data.turns[0],2),'VOICE_0001');assert.deepEqual(d.export().assignments,{});
+});
+test('timing notes retain confident voices; identity conflicts and manual unknown remain pending',()=>{
+  const data=make();data.turns[0].review_reasons=['check_word_timing'];data.turns[0].identity_review_reasons=[];
+  const d=new ReviewDraft(data);assert.equal(d.status('A'),'matched');assert.equal(d.turnNeedsAttention(data.turns[0]),false);
+  assert.deepEqual(d.export().assignments,{});d.overrides.a='unknown';assert.equal(d.status('A'),'pending');
+  delete d.overrides.a;data.turns[0].identity_review_reasons=['diarizer_disagreement'];assert.equal(d.status('A'),'pending');
+  d.assignGroup('A','VOICE_0001');assert.equal(d.overrides.a,'unknown');
+});
+
+test('blocked recordings remain visible but cannot enter decision exports or imports',()=>{
+  const good=make(),blocked={...make(),packet:'blocked.json',review_id:'old',decisions_allowed:false};
+  const w=new ReviewWorkspace({kind:'speaker_review_batch',batch_id:'allowed-only',profiles:good.profiles,recordings:[blocked,good]});
+  assert.equal(w.records.length,2);
+  assert.deepEqual(w.export().reviews.map(r=>r.packet),[good.packet]);
+  assert.throws(()=>w.load({...w.drafts[0].export()}),/stale/);
+  const single=new ReviewWorkspace(blocked);
+  assert.throws(()=>single.export(),/No current reviews/);
+  const allBlocked=new ReviewWorkspace({kind:'speaker_review_batch',batch_id:'none',profiles:good.profiles,recordings:[blocked]});
+  assert.throws(()=>allBlocked.export(),/No current reviews/);
 });

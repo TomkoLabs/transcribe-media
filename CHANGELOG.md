@@ -1,5 +1,65 @@
 # Changelog
 
+## 1.16.0.dev1 — 2026-09-19
+
+- Isolate stale or malformed recording reviews during cached voice refresh.
+  Matching full SHA-256 content tolerates mtime changes; changed media remains
+  blocked and its prior exports are backed up before DRAFT quarantine.
+- Add read-only `--diagnose-reviews`, exact-key `--recover-review` with dry-run
+  and explicit identical-content relocation, and targeted `--only-source`.
+  Recovery journals writes and preserves registry learning and historical state.
+- Show saved status, authoritative pending count and freshness in offline review;
+  exclude blocked records from decision exports. Improve stale-decision diagnostics.
+- Share pending-turn/group readiness and document the reviewed TXT contract and
+  safe backup/upgrade/recovery/transfer/clean-room procedures.
+- Synthetic CPU/Node validation only. Real Kraken/GPU/operator acceptance remains
+  required. Minor development version reflects new operator recovery commands;
+  no stable release tag is created.
+
+## 1.15.1 — 2026-09-15
+
+- Separate acoustic outliers from diarizer disagreement in saved and newly
+  extracted evidence. Verified-reference agreement can resolve a false group-wide
+  mixed flag; unsupported disputed samples and actual mixed voices still block it.
+- Independently supported, non-overlapping local clusters can match the same known
+  person. Preserve the overlap guard and detect when secondary label differences
+  name the same already-matched person. No automatic identity enrollment or merging.
+- Keep timing/text notes and playback visible without revoking confident speaker
+  assignments. Identity conflicts and unknown speech remain in the review queue;
+  explicit UNKNOWN exclusions and other manual choices remain authoritative.
+- Show actual verified-reference candidates, matching blockers and reference
+  counts scoped to the new recording. Preserve earlier verified references.
+- Batch reference comparisons as the library grows, retaining the consensus score
+  calculation and thresholds. No new model, dependency or GPU requirement.
+
+After pulling, run `./transcribe-media --refresh-voices` and reopen the review page.
+No retranscription or reinstall is needed; saved decisions and review IDs remain
+compatible. `--refresh-context` does not rematch speakers. Automated/synthetic
+checks validate the rules, not an accuracy or review-count claim on private audio.
+
+## 1.15.0 — 2026-09-15
+
+- Quality mode enables selective emotion2vec+ Large vocal-emotion context.
+  Display requires an adult profile, clear non-overlapping speech, usable word
+  timing, strong scores and agreement between two audio crops. Neutral, child,
+  weak and inconsistent evidence is omitted. Scores are not clinical probabilities.
+- Clean parts of overlapped turns can contribute emotion context. Speaker edits
+  preserve source-time windows that remain inside a single resulting turn.
+  New `--refresh-context` recomputes context from saved review audio, preserving
+  text, identities, reference evidence and review IDs, with transactional recovery.
+- New quality ASR saves Whisper word times alongside forced alignment and flags
+  disagreements. Review adds word playback and original ASR sentence playback;
+  reference excerpts show only fully contained words. Old sentence anchors remain
+  usable without retranscription.
+- Review prioritizes pending soundbites, offers verified-reference suggestions
+  and moves through a batch with one next-soundbite button. Confident unflagged
+  matches remain automatic. Group choices protect flagged exceptions and preserve
+  explicit corrections, reducing accidental blanket approval of mixed groups.
+- No new Python dependencies or larger GPU requirement. See README for the
+  existing-installation upgrade; fresh installs use the same quality command.
+  Automated and synthetic browser/CPU checks do not establish WER/DER, emotion
+  accuracy or end-to-end target-GPU acceptance.
+
 ## 1.14.2 — 2026-09-12
 
 - Removed repeated `[speaker attribution uncertain]` tags from primary transcripts

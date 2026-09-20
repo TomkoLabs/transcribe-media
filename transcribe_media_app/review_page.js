@@ -3,7 +3,7 @@ const byId=id=>document.getElementById(id);
 const inputData=JSON.parse(byId('review-data').textContent);
 let workspace=new ReviewWorkspace(inputData),data=workspace.records[0],draft=workspace.drafts[0];
 let filter='pending',stopAt=null,activeClip=null,shownLocals=null,projectHandle=null;
-let playbackRange=null,playbackTitle='',playRequest=0,playTimer=null;
+let playbackRange=null,playbackTitle='',playRequest=0,playTimer=null,lastQueueTurn=null;
 const openDetails=new Set();
 const storageKey='transcribe-review:'+(workspace.batch?inputData.batch_id:data.review_id)+':'+workspace.records.map(r=>r.draft_revision).join(':');
 const filename=workspace.batch?'batch-'+inputData.batch_id.slice(0,16)+'.decisions.json':data.packet.replace(/\.json$/,'.decisions.json');
@@ -41,16 +41,19 @@ function updatePlayback() {
   const text=playbackTitle+' · '+phase+' · target '+time(playbackRange.targetStart)+' → '+time(playbackRange.targetEnd)+
     ' · listening '+time(playbackRange.start)+' → '+time(playbackRange.end);
   if(byId('playback-info').textContent!==text)byId('playback-info').textContent=text;
+  for(const word of activeClip?.querySelectorAll('.word')||[])word.classList.toggle('word-playing',audio.currentTime>=Number(word.dataset.start)&&audio.currentTime<Number(word.dataset.end));
   activeClip?.classList.toggle('target-playing',audio.currentTime>=playbackRange.targetStart&&audio.currentTime<playbackRange.targetEnd);
   if(stopAt!==null&&audio.currentTime>=stopAt){audio.pause();stopAt=null;}
 }
-async function listen(start,end,container,uncertain,title) {
+async function listen(start,end,container,uncertain,title,sourceRange=null) {
   stopPlayback();
   const request=playRequest,audio=byId('audio');
   try {
     await audioReady(audio);
     if(request!==playRequest)return;
     playbackRange=ReviewPlayback.bounds(start,end,audio.duration,ReviewPlayback.padding(byId('context').value,uncertain));
+    if(sourceRange){const source=ReviewPlayback.bounds(sourceRange.start,sourceRange.end,audio.duration,0);
+      playbackRange={...playbackRange,start:source.start,end:source.end};}
     playbackTitle=title;activeClip=container;container.classList.add('playing');
     stopAt=playbackRange.end;audio.currentTime=playbackRange.start;
     updatePlayback();await audio.play();
@@ -74,9 +77,14 @@ byId('context').onchange=()=>stopPlayback();
 function profileSelect(value,label,blank){const select=document.createElement('select');select.setAttribute('aria-label',label);select.add(new Option(blank||'Not assigned — choose a person',''));select.add(new Option('Unknown / review later','unknown'));select.add(new Option('UNKNOWN — exclude from voice learning','ignore'));
 for(const p of data.profiles){const current={...p,...draft.updates[p.voice_id]};select.add(new Option(current.label+' · '+p.voice_id+(current.archived?' (archived)':''),p.voice_id))}
 for(const [key,p] of Object.entries(draft.newProfiles)){if(!(draft.data.new_profile_ids||{})[key])select.add(new Option('New: '+p.label,key))}select.value=value||'';return select}
-function turnAttention(turn){return turn.speaker_attribution?.status==='uncertain'}
+function turnAttention(turn){return !!turn.review_reasons?.length||draft.turnRisk(turn)}
 function attention(local){return draft.needsAttention(local)}
-function updateCounts(){const pending=draft.locals.filter(attention).length,assigned=draft.locals.length-pending;byId('progress').textContent=pending+' voice group'+(pending===1?'':'s')+' needing attention · '+assigned+' already assigned';byId('filter-pending').textContent='Needs attention ('+pending+')';byId('filter-assigned').textContent='Already assigned ('+assigned+')';byId('profile-count').textContent=data.profiles.length+' existing profiles · add, rename or archive people';for(const name of ['pending','assigned','all'])byId('filter-'+name).setAttribute('aria-pressed',String(filter===name))}
+function updateCounts(){
+const saved=data.saved_status;
+if(saved)byId('saved-status').textContent='Saved state: '+saved.state+' · '+(saved.pending??'unknown')+' pending item(s) · Decisions '+(data.decisions_allowed?'allowed':'BLOCKED')+'. '+saved.action+' Snapshot '+saved.snapshot_id+' · generated '+saved.generated_utc+' · version '+(saved.program_version||inputData.program_version||'unknown')+'. Offline snapshot: regenerate and reopen after CLI changes.';
+const canExport=workspace.records.some(r=>r.decisions_allowed!==false);
+for(const id of ['save','save-project','copy'])byId(id).disabled=!canExport;
+const pending=draft.locals.filter(attention).length,assigned=draft.locals.length-pending;byId('progress').textContent=data.decisions_allowed===false?'Blocked saved source. Follow the recovery action above; browser edits cannot finalize it.':'Unapplied browser draft: '+draft.pendingTurns().length+' soundbite'+(draft.pendingTurns().length===1?'':'s')+' needing attention · '+pending+' voice group'+(pending===1?'':'s')+' needing attention · '+assigned+' already assigned';byId('filter-pending').textContent='Needs attention ('+pending+')';byId('filter-assigned').textContent='Already assigned ('+assigned+')';byId('profile-count').textContent=data.profiles.length+' existing profiles · '+data.profiles.reduce((n,p)=>n+(p.verified_windows||0),0)+' verified reference clips retained across recordings';for(const name of ['pending','assigned','all'])byId('filter-'+name).setAttribute('aria-pressed',String(filter===name))}
 function redraw(){const y=window.scrollY;renderPeople();renderCards();updateCounts();updateNavigation();window.scrollTo(0,y)}
 function changed(){stopPlayback();workspace.synchronize(draft);persist();redraw()}
 function renderPeople(){const list=byId('profile-list');list.replaceChildren();
@@ -88,31 +96,56 @@ const save=element('button','Save profile edit');save.onclick=()=>{const value=i
 for(const [key,p] of Object.entries(draft.newProfiles)){if((draft.data.new_profile_ids||{})[key])continue;const row=element('div',null,'person row');const label=element('input');label.type='text';label.maxLength=80;label.value=p.label;label.setAttribute('aria-label','Draft profile '+p.label);const role=element('select');role.setAttribute('aria-label','Role for draft '+p.label);for(const value of ['unspecified','adult','child'])role.add(new Option(value,value));role.value=p.role;const save=element('button','Update label');save.onclick=()=>{if(!label.value.trim()||/[\x00-\x1f]/.test(label.value))return message('Enter a valid label.',true);draft.newProfiles[key]={label:label.value.trim(),role:role.value};changed()};const remove=element('button','Remove draft person');remove.onclick=()=>{workspace.removePerson(key);changed()};row.append(element('span','New person'),label,role,save,remove);list.append(row)}}
 function renderCards(){for(const details of document.querySelectorAll('details[data-open-key]')){details.open?openDetails.add(details.dataset.openKey):openDetails.delete(details.dataset.openKey)}
 if(shownLocals===null)shownLocals=new Set(draft.locals.filter(local=>filter==='all'||(filter==='pending'?attention(local):!attention(local))));
-byId('cards').replaceChildren();let visible=0;
+byId('cards').replaceChildren();
+if(data.decisions_allowed===false){byId('cards').append(element('p','This saved source is blocked. Recover it before reviewing or exporting its decisions.','warning'));return;}
+let visible=0;
 for(const local of draft.locals){const needs=attention(local),status=draft.status(local);if(!shownLocals.has(local))continue;visible++;
-const turns=data.turns.filter(t=>(t.local_speaker||t.speaker)===local),match=data.matches.find(m=>m.local_speaker===local),section=element('section',null,'group'+(needs?' needs-review':'')),head=element('div',null,'group-head'),heading=element('div',null,'group-heading');heading.append(element('h2',local+' · '+turns.length+' soundbite'+(turns.length===1?'':'s')),element('span',status==='matched'?(needs?'Check speaker timing':'Confident automatic match'):status==='reviewed'?(draft.machine[local]&&!draft.assignments[local]?'Automatic match + your corrections':'Chosen by you'):'Choose a person','badge '+status));head.append(heading);
-if(match?.candidates?.length){const text=match.candidates.map(c=>draft.label(c.speaker)+' '+c.similarity.toFixed(3)).join(' · ');head.append(element('p','Likely matches (similarity): '+text,'muted'))}else head.append(element('p',status==='pending'?'No trained match yet. Reuse an existing person or choose a new label.':'Your choices below identify the speech in this group.','muted'));
+const turns=data.turns.filter(t=>(t.local_speaker||t.speaker)===local),match=data.matches.find(m=>m.local_speaker===local),section=element('section',null,'group'+(needs?' needs-review':'')),head=element('div',null,'group-head'),heading=element('div',null,'group-heading');heading.append(element('h2',local+' · '+turns.length+' soundbite'+(turns.length===1?'':'s')),element('span',status==='matched'?(needs?'Check speaker timing':'Confident automatic match'):status==='reviewed'?(draft.machine[local]&&!draft.assignments[local]?'Automatic match + your corrections':'Chosen by you'):(draft.groupChoice(local)?'Review exceptions':'Choose a person'),'badge '+status));head.append(heading);
+const candidates=match?.reference_candidates?.length?match.reference_candidates:match?.candidates;
+if(candidates?.length){const text=candidates.map(c=>draft.label(c.speaker)+' '+c.similarity.toFixed(3)).join(' · ');head.append(element('p',(match.reference_candidates?.length?'Verified reference matches (similarity): ':'Overall voice resemblance (suggestions only): ')+text,'muted'))}else head.append(element('p',status==='pending'?'No trained match yet. Reuse an existing person or choose a new label.':'Your choices below identify the speech in this group.','muted'));
+const diagnostic=match?.matching_diagnostics;
+if(diagnostic){
+  if(Number.isFinite(diagnostic.compared_windows))head.append(element('p',diagnostic.supporting_windows+' / '+diagnostic.compared_windows+' comparable voice samples support this match; '+diagnostic.model_disputed_windows+' disputed samples handled separately.','muted'));
+  if(status==='pending'&&diagnostic.blockers?.length)head.append(element('p','Why this group is unassigned: '+diagnostic.blockers.map(reason=>({
+    insufficient_query_audio:'too little usable speech',no_verified_profiles:'no trained reference profile yet',
+    insufficient_independent_windows:'too few independent speech samples',inconsistent_window_matches:'voice samples do not consistently agree',
+    unresolved_disputed_voice_evidence:'disputed samples do not confirm the same known voice',
+    mixed_voice_evidence:'acoustic samples suggest multiple voices',insufficient_verified_reference_match:'verified-reference similarity is below the required threshold',
+    ambiguous_profile_match:'the best profiles are too close',overlap_with_same_profile:'two simultaneous groups cannot be assigned to the same person'
+  })[reason]||reason.replaceAll('_',' ')).join('; ')+'.','warning'));
+}
 const referenceProgress=draft.referenceProgress(local);
-if(referenceProgress.total)head.append(element('p',referenceProgress.reviewed+' / '+referenceProgress.total+' reference clips explicitly assigned','muted'));
+if(referenceProgress.total)head.append(element('p',referenceProgress.reviewed+' / '+referenceProgress.total+' reference clips approved from this recording (earlier verified references are retained)','muted'));
 if(status==='pending'&&referenceProgress.total&&referenceProgress.reviewed===referenceProgress.total){
-  head.append(element('p','Reference clips are assigned; other spoken words still need a person. Confirm the whole group only after listening for exceptions.','warning'));
+  head.append(element('p','Reference clips are assigned; other spoken words still need a person. Assign the remaining unflagged speech after listening; flagged exceptions still need individual choices.','warning'));
   if(referenceProgress.person&&referenceProgress.person!=='ignore'){
     const complete=element('button','Assign remaining speech to '+draft.label(referenceProgress.person),'small');
-    complete.onclick=()=>{draft.assignments[local]=referenceProgress.person;changed()};head.append(complete);
+    complete.onclick=()=>{draft.assignGroup(local,referenceProgress.person);changed()};head.append(complete);
   }
 }
 if(data.mixed.includes(local))head.append(element('p','This group may contain different people. Use clip or turn corrections for the exceptions.','warning'));
-const assign=element('div',null,'assignment'),label=element('label','Assign this whole group'),id='group-'+draft.locals.indexOf(local);label.htmlFor=id;const select=profileSelect(draft.groupChoice(local),'Assign '+local,status==='reviewed'?'Individual soundbites assigned below':null);select.id=id;select.dataset.local=local;select.onchange=()=>{if(select.value)draft.assignments[local]=select.value;else delete draft.assignments[local];changed()};assign.append(label,select);head.append(assign,element('p','Applies to every soundbite in this group unless you set a clip or turn correction below.','muted'));if(draft.machine[local]&&!draft.assignments[local]){const confirm=element('button','Confirm this person & learn','small');confirm.onclick=()=>{draft.assignments[local]=draft.groupChoice(local);changed()};head.append(element('p','Automatic matches do not train themselves. After listening, optionally confirm this person to approve the selected reference clips.','muted'),confirm)}section.append(head);
-const body=element('div',null,'group-body'),windows=data.windows[local]||[];body.append(element('h3','Reference clips · listen, identify, then choose what may train the voice'));
+const assign=element('div',null,'assignment'),label=element('label','Default person for this group'),id='group-'+draft.locals.indexOf(local);label.htmlFor=id;const select=profileSelect(draft.groupChoice(local),'Assign '+local,status==='reviewed'?'Individual soundbites assigned below':null);select.id=id;select.dataset.local=local;select.onchange=()=>{draft.assignGroup(local,select.value);changed()};assign.append(label,select);head.append(assign,element('p','Applies to unflagged speech. Flagged soundbites stay for individual review; existing corrections are preserved.','muted'));if(draft.machine[local]&&!draft.assignments[local]){const confirm=element('button','Confirm this person & learn','small');confirm.onclick=()=>{draft.assignGroup(local,draft.groupChoice(local));changed()};head.append(element('p','Automatic matches do not train themselves. After listening, optionally confirm this person to approve the selected reference clips.','muted'),confirm)}section.append(head);
+const body=element('div',null,'group-body'),windows=data.windows[local]||[],refs=element('details');refs.dataset.openKey='training:'+local;refs.open=openDetails.has(refs.dataset.openKey);refs.append(element('summary','Voice learning reference clips · '+windows.length+' sample'+(windows.length===1?'':'s')),element('p','These are acoustic samples, not whole transcript sentences. Train only clips you have listened to.','muted'));
 const samples=element('div',null,'samples'),moreSamples=element('div',null,'samples'),more=element('details');more.dataset.openKey='references:'+local;more.open=openDetails.has(more.dataset.openKey);more.append(element('summary','Show all '+windows.length+' reference clips'),moreSamples);const firstClips=new Set(windows.length<=6?windows.map((_,i)=>i):Array.from({length:6},(_,i)=>Math.round(i*(windows.length-1)/5)));windows.forEach((w,i)=>{const values=draft.clipChoices(local,w.start,w.end),assigned=values.length===1?draft.label(values[0]):'Mixed assignments — inspect turns',clip=element('article',null,'clip'+(w.retained===false||w.model_disagreement?' attention':''));clip.dataset.clip=local+':'+i;const title=element('div',null,'clip-head');title.append(element('strong','Clip '+(i+1)),playButton(w.start,w.end,clip,w.model_disagreement||w.retained===false||turns.some(t=>t.start<w.end&&t.end>w.start&&turnAttention(t)),local+' · clip '+(i+1)));clip.append(title,element('div',time(w.start)+' → '+time(w.end)+' · '+w.duration.toFixed(1)+'s','timestamp'));
-const excerpt=turns.filter(t=>t.start<w.end&&t.end>w.start).flatMap(t=>t.words?.length?t.words.filter(word=>word.start<w.end&&word.end>w.start).map(word=>word.text||word.word||''):[t.text]).join(' ');clip.append(element('p',excerpt.length>300?excerpt.slice(0,300)+'…':excerpt||'No aligned text for this clip.','excerpt'),element('div','Speaker: '+assigned,'assigned'));
+const excerpt=ReviewPlayback.clipText(turns,w.start,w.end);
+clip.append(element('p',excerpt.text||'No complete aligned words inside this reference clip. Use the soundbites above for transcript review.','excerpt'));
+if(excerpt.partial)clip.append(element('p','Some words cross the clip boundary and are omitted from this excerpt.','muted'));
+clip.append(element('div','Speaker: '+assigned,'assigned'));
+if(w.candidates?.length)clip.append(element('p','Reference comparison: '+w.candidates.map(c=>draft.label(c.speaker)+' '+c.similarity.toFixed(3)).join(' · ')+' (similarity, not probability)','muted'));
 const correction=profileSelect('', 'Correct speaker for '+local+' clip '+(i+1),'Change only this clip…');correction.onchange=()=>{if(correction.value){draft.setClip(local,w.start,w.end,correction.value);changed()}};clip.append(correction);
 const excludedIdentity=values.some(value=>value==='unknown'||value==='ignore');const check=element('input');check.type='checkbox';check.dataset.window=local+':'+i;check.checked=!excludedIdentity&&!draft.excluded.has(local+':'+i)&&!!w.reference_eligible;check.disabled=excludedIdentity||!w.reference_eligible;check.onchange=()=>{check.checked?draft.excluded.delete(local+':'+i):draft.excluded.add(local+':'+i);persist()};const ref=element('label',null,'reference'+(!w.reference_eligible?' disabled':''));ref.append(check,document.createTextNode(excludedIdentity?'Excluded from voice learning: unknown speaker':w.reference_eligible?'Use this clip to learn the assigned voice':'Transcript correction only; unsuitable training audio'));clip.append(ref);
 if(w.retained===false||w.model_disagreement)clip.append(element('p','Extra verification: models or clips disagree. Listen before including this reference.','muted'));
-else if(w.duration<2.5)clip.append(element('p','Short reference: contributes with other consistent reviewed clips.','muted'));(firstClips.has(i)?samples:moreSamples).append(clip)});body.append(samples);if(windows.length>6)body.append(more);
-if(!windows.length)body.append(element('p','No suitable reference clips were extracted. You can still assign a person and save the transcript. Their voice can learn from later recordings.','notice'));
-const details=element('details');details.dataset.openKey='turns:'+local;details.open=openDetails.has(details.dataset.openKey);details.append(element('summary','All '+turns.length+' soundbite'+(turns.length===1?'':'s')+' · inspect or correct individual turns'));
-for(const [index,t] of turns.entries()){const row=element('article',null,'turn'+(turnAttention(t)?' attention':''));row.dataset.turnCard=t.id;const top=element('div',null,'clip-head');top.append(element('strong','Soundbite '+(index+1)),playButton(t.start,t.end,row,turnAttention(t),local+' · soundbite '+(index+1)));row.append(top,element('div',time(t.start)+' → '+time(t.end),'timestamp'),element('p',t.text));const values=draft.spokenChoices(t);row.append(element('div','Speaker: '+(values.length===1?draft.label(values[0]):'Mixed — see time corrections'),'assigned'));if(turnAttention(t))row.append(element('p','The models disagree about timing or overlap. Listen with surrounding context; the target may contain a speaker change. Widen to 5s if the words are still cut off.','warning'));
+else if(w.duration<2.5)clip.append(element('p','Short reference: contributes with other consistent reviewed clips.','muted'));(firstClips.has(i)?samples:moreSamples).append(clip)});refs.append(samples);if(windows.length>6)refs.append(more);
+if(!windows.length)refs.append(element('p','No suitable reference clips were extracted. You can still assign a person and save the transcript. Their voice can learn from later recordings.','notice'));
+const details=element('details');details.dataset.openKey='turns:'+local;details.open=openDetails.has(details.dataset.openKey)||turns.some(t=>draft.turnNeedsAttention(t));details.append(element('summary',(filter==='pending'?'Needs attention: '+turns.filter(t=>draft.turnNeedsAttention(t)).length+' of ': 'All ')+turns.length+' soundbite'+(turns.length===1?'':'s')+' · inspect or correct individual turns'));
+for(const [index,t] of turns.entries()){if(filter==='pending'&&!draft.turnNeedsAttention(t))continue;const row=element('article',null,'turn'+(turnAttention(t)?' attention':''));row.dataset.turnCard=t.id;const top=element('div',null,'clip-head');top.append(element('strong','Soundbite '+(index+1)),playButton(t.start,t.end,row,turnAttention(t),local+' · soundbite '+(index+1)));row.append(top,element('div',time(t.start)+' → '+time(t.end),'timestamp'),element('p',t.text));row.append(element('span',draft.turnNeedsAttention(t)?'Needs your review':draft.spokenChoices(t,true).every(v=>v&&v!=='unknown')?'Chosen by you':'Confident automatic match','badge '+(draft.turnNeedsAttention(t)?'pending':'reviewed')));const values=draft.spokenChoices(t);row.append(element('div','Speaker: '+(values.length===1?draft.label(values[0]):'Mixed — see time corrections'),'assigned'));if(turnAttention(t))row.append(element('p',(draft.turnRisk(t)?'Speaker check: ':'Timing/text note — speaker choice is retained: ')+(t.review_reasons||['speaker timing disputed']).map(r=>r.replace(/^check_/, '').replaceAll('_',' ')).join(' · ')+'. If words are missing from playback, try the source sentence below.','warning'));
+if(t.suggested_speakers?.length)row.append(element('p','Voice-reference suggestions: '+t.suggested_speakers.map(id=>draft.label(id)).join(' / ')+'. Listen before selecting.','muted'));
+else if(draft.machine[local]&&draft.turnNeedsAttention(t))row.append(element('p','Group match suggests '+draft.label(draft.machine[local])+', but this soundbite still needs checking.','muted'));
+const source=t.review_timing?.source_context;
+if(source){const sentence=playButton(source.start,source.end,row,false,'Original ASR sentence');sentence.textContent='▶ Listen to source sentence';sentence.onclick=()=>listen(t.start,t.end,row,false,'Source sentence · correction target unchanged',source);sentence.setAttribute('aria-label','Listen to source sentence for '+t.id);row.append(sentence,element('p',source.text,'source-excerpt'));}
+const wordList=element('div',null,'word-list');
+for(const word of t.words||[]){if(!Number.isFinite(word.start)||!Number.isFinite(word.end)||word.end<=word.start)continue;const button=playButton(word.start,word.end,row,!!word.timing?.issues?.length,'Word: '+(word.text||word.word));button.textContent=word.text||word.word;button.classList.add('word');button.dataset.start=word.start;button.dataset.end=word.end;button.title=time(word.start)+' → '+time(word.end)+(word.timing?.issues?.length?' · timing uncertain':'');wordList.append(button);}
+if(wordList.childElementCount)row.append(element('p','Click a word to hear its aligned position. The source sentence uses the recognizer’s original times.','muted'),wordList);
 const choice=profileSelect(draft.overrides[t.id]||'','Speaker for '+t.id,'Use group assignment');choice.dataset.turn=t.id;choice.onchange=()=>{if(choice.value)draft.overrides[t.id]=choice.value;else delete draft.overrides[t.id];draft.ranges=draft.ranges.filter(r=>r.turn_id!==t.id);changed()};row.append(choice);
 const ranges=element('details');ranges.dataset.openKey='ranges:'+t.id;ranges.open=openDetails.has(ranges.dataset.openKey)||draft.ranges.some(r=>r.turn_id===t.id);ranges.append(element('summary','Correct part of this soundbite'));
 for(const r of draft.ranges.filter(r=>r.turn_id===t.id)){const item=element('div',null,'range'),remove=element('button','Remove correction','small');remove.onclick=()=>{draft.ranges=draft.ranges.filter(item=>item!==r);changed()};item.append(element('span',time(r.start)+' → '+time(r.end)+' · '+draft.label(r.profile)),playButton(r.start,r.end,row,turnAttention(t),'Saved correction'),remove);ranges.append(item)}
@@ -141,7 +174,7 @@ const audition=element('div',null,'row');audition.append(preview,markStart,markE
 controls.append(rangeChoice,apply);
 ranges.append(element('p','Listen, pause near a speaker change, and mark the playhead or type seconds. Preview before applying.','muted'),
   audition,controls,element('p','Context is for listening only. Corrections use word midpoints inside the selected start/end; recognized words and training clip boundaries stay unchanged.','muted'));
-row.append(ranges);details.append(row)}body.append(details);section.append(body);byId('cards').append(section)}
+row.append(ranges);details.append(row)}body.append(details,refs);section.append(body);byId('cards').append(section)}
 if(!visible)byId('cards').append(element('div',filter==='pending'?'No unassigned groups in this recording. Move to the next recording, save changes, or open Already assigned for a spot check.':'No voice groups in this view.','empty'))}
 byId('add').onclick=()=>{const label=byId('name').value.trim();if(!label||/[\x00-\x1f]/.test(label))return message('Enter a valid person label.',true);if([...data.profiles,...Object.values(draft.newProfiles)].some(p=>p.label.toLowerCase()===label.toLowerCase()))return message('That label already exists. Choose that person instead of creating a duplicate.',true);draft.newProfiles[workspace.newKey()]={label,role:byId('role').value};byId('name').value='';changed()};
 for(const name of ['pending','assigned','all'])byId('filter-'+name).onclick=()=>{filter=name;shownLocals=null;renderCards();updateCounts()};
@@ -154,16 +187,16 @@ function updateNavigation(){
   byId('recording-nav').hidden=!workspace.batch;
   if(!workspace.batch)return;
   const select=byId('recording');select.replaceChildren();
-  const counts=workspace.drafts.map(item=>item.locals.filter(local=>item.needsAttention(local)).length);
-  workspace.records.forEach((record,i)=>select.add(new Option((i+1)+'. '+record.source+' · '+counts[i]+' need attention',String(i))));
+  const counts=workspace.drafts.map(item=>item.pendingTurns().length);
+  workspace.records.forEach((record,i)=>select.add(new Option((i+1)+'. '+record.source+' · '+(record.saved_status?record.saved_status.state+' · '+(record.saved_status.pending??'unknown')+' saved pending':counts[i]+' draft need attention'),String(i))));
   select.value=String(workspace.current);
-  byId('batch-progress').textContent=workspace.records.length+' recordings · '+counts.reduce((a,b)=>a+b,0)+' groups need attention across the batch';
+  byId('batch-progress').textContent=workspace.records.length+' recordings · '+workspace.records.filter(r=>r.decisions_allowed===false).length+' blocked (excluded from export) · '+counts.reduce((a,b)=>a+b,0)+' soundbites need attention in unapplied browser drafts';
 }
 byId('recording').onchange=()=>selectRecording(Number(byId('recording').value));
 byId('next-pending').onclick=()=>{for(let offset=1;offset<=workspace.records.length;offset++){
   const index=(workspace.current+offset)%workspace.records.length;
   if(workspace.drafts[index].locals.some(local=>workspace.drafts[index].needsAttention(local))){selectRecording(index);return;}}
-  message('All groups have choices. Save the batch and run the apply command.');};
+  message('No more browser draft soundbites. Check Saved state; blocked recordings require recovery. Export eligible reviews and apply to update transcripts.');};
 const folderSupported=ReviewIO.folderSupport(window);
 byId('save-project').hidden=!folderSupported;
 byId('folder-status').textContent=folderSupported?
@@ -180,3 +213,15 @@ byId('save-project').onclick=async()=>{try{
   message(failure.text,failure.blocked);
 }};
 selectRecording(0);
+
+byId('next-soundbite').onclick=()=>{
+  let pending=draft.pendingTurns();
+  if(!pending.length){byId('next-pending').click();pending=draft.pendingTurns();}
+  if(!pending.length)return message('No soundbites need attention. Download and apply your review.');
+  filter='pending';shownLocals=null;redraw();
+  const previous=pending.findIndex(t=>t.id===lastQueueTurn?.id&&workspace.current===lastQueueTurn.recording);
+  const next=pending[(previous+1)%pending.length];lastQueueTurn={id:next.id,recording:workspace.current};
+  const card=document.querySelector('[data-turn-card="'+next.id+'"]');
+  card?.scrollIntoView({block:'center',behavior:'smooth'});
+  card?.querySelector('button')?.focus({preventScroll:true});
+};

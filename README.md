@@ -3,7 +3,8 @@
 Local transcription with persistent speaker identities and an offline review
 page. Optimized for **two adults, with an occasional child**, with quality over
 speed. **Quality mode is the default:** Whisper large-v3, word alignment,
-speaker diarization and conservative matching against reviewed voice references.
+speaker diarization, conservative matching against reviewed voice references,
+and selective vocal-emotion estimates.
 Audio stays on the machine running the script.
 
 ## Quick start: Debian + RTX 3080
@@ -55,14 +56,16 @@ contain solo recordings.
 
 Open **`Review/speaker-reviews/index.html`** in your browser. No server is needed.
 
-1. Start with **Needs attention**. Confident matches are already assigned.
-   Listen, then select Adult A, Adult B, Child, or the same existing person across
-   recordings. **People & profile labels** manages the shared names.
-2. Correct exceptions using **Change only this clip** or **All soundbites**.
-   Listen includes surrounding audio, with extra context for uncertain clips.
-   Partial corrections have preview and playhead controls. Uncheck noisy/mixed
-   training clips; choose **UNKNOWN — exclude from voice learning** for passages
-   you want to leave anonymous without further identity review.
+1. Start with **Needs attention**, then **Next soundbite needing attention**.
+   Confident, unflagged speech is already assigned. Choose the person for each
+   queued soundbite; verified-reference matches and reasons explain remaining
+   uncertainty. Timing/text notes alone do not require choosing the speaker again.
+   **People & profile labels** manages shared names and adult/child roles across recordings.
+2. A **Default person for this group** assigns unflagged speech and preserves
+   exceptions for individual review. Click words to listen at their aligned times;
+   **Listen to source sentence** provides the recognizer's original audio range.
+   Expand **Voice learning reference clips** to approve clean training samples.
+   Use **UNKNOWN — exclude from voice learning** for intentionally anonymous speech.
 3. **Download JSON**, then move that file into **`speaker-decisions/`** inside
    this project. Keep its filename. Download location depends on your browser.
 4. **Copy apply command** and run it from the project folder. For example:
@@ -85,23 +88,41 @@ command & optional folder saving**; use the download steps if the browser blocks
 
 ## Update an existing installation
 
+For **1.16.0.dev1**, first back up the runtime directories as described in the
+[review recovery runbook](docs/REVIEW_RECOVERY.md), then:
+
 ```bash
-git pull --ff-only
-./transcribe-media --render-transcripts
-./transcribe-media --review-speakers
+git pull --ff-only origin main
+./transcribe-media --diagnose-reviews
+./transcribe-media --refresh-voices
 ```
 
-This updates saved text/subtitles and review pages without running models.
-Words, speaker assignments and profiles stay unchanged. Reopen the regenerated HTML.
-No reinstall is needed for this update.
-Run `./install.sh` again when a future update changes model/dependency requirements.
-Back up first: version/settings changes can cause normal processing to rerun.
+Refresh isolates changed/unavailable recordings and regenerates current reviews
+for the others. Full-content-equivalent metadata changes need no ASR. Use
+`--recover-review 'exact-source-key' --dry-run` to inspect targeted recovery before
+applying it. Real content changes require targeted `--only-source` transcription
+on the operator machine. Recovery preserves private backups and the registry.
+No reinstall, model download or broad retranscription is needed for this update.
+Read [the finalized TXT contract](docs/TXT_CONTRACT.md) before downstream transfer.
+Reopen the generated index and check Saved state and snapshot time; browser drafts
+are unapplied edits, not the CLI's saved pending count.
+
+`--refresh-context` updates acoustic/emotion notes; it does **not** rematch voices.
+If you have not yet enabled the emotion context introduced in 1.15.0, run
+`./transcribe-media --prepare-models` online, then `./transcribe-media --refresh-context`.
+For just the current UI, use `./transcribe-media --review-speakers`.
+
+Apply pending exports before a normal processing run: version/settings changes
+can regenerate recording evidence and review IDs. Such runs normally reuse the
+ASR cache but still rerun speaker analysis. Do not use `--overwrite` just to upgrade;
+it runs fresh ASR and can invalidate old time-based decisions. Back up before updating.
 
 ## Useful commands
 
 | Need | Command |
 | --- | --- |
 | Rematch cached transcripts after other profile improvements; wording stays unchanged | `./transcribe-media --refresh-voices` |
+| Disable vocal-emotion estimates for new processing | `./transcribe-media --no-tone` |
 | Freeze automatic profile learning; explicit reviews still apply | `./transcribe-media --no-speaker-learning` |
 | Include source subfolders | `./transcribe-media --recursive` |
 | Change language | `./transcribe-media --language fr` or `--language auto` |
@@ -119,13 +140,20 @@ Git. Keep originals at the same location while reviewing, and keep review HTML
 beside its WAV files when copying to another computer. Custom source folders
 still use this checkout's output directories and shared registry by default.
 
-Collect clean reviewed clips from several sessions for each person. Similarity
+Collect clean reviewed clips from several sessions for each person. The reference
+clip counter in a review counts that recording only; earlier references are retained.
+The same known person can match several non-overlapping detected groups. Similarity
 scores are not probabilities, and adult/child roles are supplied by you. Noise,
 short replies and overlapping speech can still confuse the models. Verify
 consequential words and speaker assignments against the recording before use
 in therapist analysis; the script provides no therapeutic interpretation.
 
-The 3080 is the intended quality target; this update needs no larger model or GPU.
+Vocal-emotion labels appear only for adult profiles and sufficiently clear,
+consistent speech. Silence means the model abstained, not that the speaker was
+neutral. These are estimates of vocal expression, not psychological assessments.
+
+The 3080 remains the quality target. Emotion analysis runs on CPU by default and
+adds processing time; this update does not require more GPU memory.
 GX10 has a separate ARM/CUDA installation path. End-to-end GPU acceptance and
 measured accuracy benchmarks remain outstanding; installer checks must pass on
 your machine. Ollama is not used. See [hardware and troubleshooting](QUALITY_GUIDE.md#hardware-and-models).

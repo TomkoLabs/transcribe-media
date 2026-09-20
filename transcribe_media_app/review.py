@@ -16,6 +16,8 @@ from .speakers import (VoiceRegistry, SpeakerRegistryError, apply_speaker_identi
 from .storage import (ManifestStore, StateTransaction, atomic_write_json, atomic_write_text,
                       source_fingerprint, stable_hash, utc_now)
 from .schema import SAMPLE_RATE
+from .recovery import same_content, pending_count, inspect_packet, snapshot, short_fingerprint
+from . import __version__
 
 
 def packet_path(review_dir, source_key):
@@ -37,6 +39,7 @@ def _segmentation_key(result):
 
 def apply_turn_choices(result, turns, review_id, receipt=None):
     turns_by_local = {}
+    untimed_choices = {index: choice for turn in turns for index, choice in turn.get('untimed_word_choices', {}).items()}
     for turn in turns:
         turns_by_local.setdefault(str(turn.get("local_speaker") or turn["speaker"]), []).append(turn)
 
@@ -51,15 +54,22 @@ def apply_turn_choices(result, turns, review_id, receipt=None):
         return chosen.get("review_choice") if chosen is not None else None
 
     spoken_choices = {}
+    word_index = -1
     for segment in result.get("segments", []):
         for unit in segment.get("words") or [segment]:
+            counted_word = bool(segment.get('words') and str(segment.get('text') or '').strip()
+                                and str(unit.get('word') or unit.get('text') or '').strip())
+            if counted_word:
+                word_index += 1
             local = str(unit.get("local_speaker") or segment.get("local_speaker") or unit.get("speaker") or segment["speaker"])
             if local == "SPEAKER_UNKNOWN" and segment.get("local_speaker"):
                 local = str(segment["local_speaker"])
             if unit.get("start") is None or unit.get("end") is None:
-                spoken_choices.setdefault(local, set()).add(None)
-                continue
-            choice = choice_at(local, float(unit["start"]), float(unit["end"]))
+                # A whole-soundbite choice identifies an unaligned word by its
+                # original sequence position, without inventing an audio time.
+                choice = untimed_choices.get(word_index) if counted_word else None
+            else:
+                choice = choice_at(local, float(unit["start"]), float(unit["end"]))
             spoken_choices.setdefault(local, set()).add(choice)
             if choice is None:
                 continue
@@ -106,9 +116,9 @@ def restore_reviewed_choices(review_dir, source_key, fingerprint, local_result, 
         return
     packet = json.loads(path.read_text(encoding="utf-8"))
     choices = packet.get("applied_decisions")
-    if not choices:
+    if not choices or packet.get("reprocess_required"):
         return
-    if fingerprint != packet["fingerprint"] or _segmentation_key(local_result) != _segmentation_key(packet["local_result"]):
+    if not same_content(fingerprint, packet["fingerprint"]) or _segmentation_key(local_result) != _segmentation_key(packet["local_result"]):
         raise SpeakerRegistryError("recording or speaker boundaries changed after human review; previous outputs are preserved. Archive this recording's review packet before explicitly re-reviewing the new segmentation")
     turns = _resolve_choices(packet, choices)
     apply_turn_choices(result, turns, packet["review_id"])
@@ -134,14 +144,15 @@ def save_review(review_dir, source, source_key, fingerprint, local_result, evide
               "settings_hash": payload["processing"]["settings_hash"],
               "outputs": {key: str(value) for key, value in outputs.items()},
               "profiles": registry.profiles_for_review(), "matches": matches,
-              "pending": [item["local_speaker"] for item in matches
-                          if item["status"].startswith("unresolved")],
+              "pending": (payload.get("speaker_review") or {}).get("pending", [item["local_speaker"] for item in matches
+                          if item["status"].startswith("unresolved")]),
               "created_utc": utc_now()}
+    payload.setdefault("speaker_review", {"pending": packet["pending"]})
     packet["review_id"] = packet_digest(packet)
     # Keep accepted decisions when rebuilding an identical review packet.
     if path.exists():
         previous = json.loads(path.read_text(encoding="utf-8"))
-        if previous.get("fingerprint") == fingerprint and _segmentation_key(previous["local_result"]) == _segmentation_key(local_result):
+        if not previous.get("reprocess_required") and same_content(previous.get("fingerprint"), fingerprint) and _segmentation_key(previous["local_result"]) == _segmentation_key(local_result):
             packet["applied_decisions"] = previous.get("applied_decisions", {})
             packet["receipts"] = previous.get("receipts", [])
             packet["new_profile_ids"] = previous.get("new_profile_ids", {})
@@ -168,8 +179,11 @@ def save_review(review_dir, source, source_key, fingerprint, local_result, evide
 
 
 def review_data(path, packet):
-    turns = build_turns(normalize_segments(packet["local_result"]))
-    annotate_speaker_attribution(turns, packet["local_result"].get("speaker_refinement"))
+    from .timing import annotate_word_timing, turn_timing, voice_hints, identity_windows
+    from .evidence import identity_evidence_summary
+    local_result = annotate_word_timing(copy.deepcopy(packet['local_result']))
+    turns = build_turns(normalize_segments(local_result))
+    annotate_speaker_attribution(turns, local_result.get("speaker_refinement"))
     from .analysis import annotate_raw_overlap
     annotate_raw_overlap(turns, packet["local_result"].get("speaker_timeline", []))
     public = {"review_id": packet["review_id"], "packet": path.name,
@@ -180,10 +194,23 @@ def review_data(path, packet):
               "new_profile_ids": packet.get("new_profile_ids", {}),
               "draft_revision": stable_hash({key: packet.get(key) for key in
                                              ("applied_decisions", "profiles", "new_profile_ids")})[:16],
-              "mixed": [key for key, item in packet["evidence"].items() if item.get("suspected_mixed_speakers")],
-              "windows": {key: [{k: v for k, v in window.items() if k != "embedding"}
-                                 for window in item.get("windows", [])]
-                          for key, item in packet["evidence"].items()}}
+              "mixed": [key for key, item in packet["evidence"].items() if identity_evidence_summary(item)['mixed_voice_evidence']],
+              "windows": {key: [{k: v for k, v in window.items() if k != "embedding"} for window in windows]
+                          for key, windows in identity_windows(packet['evidence'], local_result, packet['matches']).items()}}
+    registry = VoiceRegistry(path.parent.parent / 'speaker_registry.json')
+    candidates = registry.review_window_candidates(packet['evidence'])
+    for local, windows in public['windows'].items():
+        for index, window in enumerate(windows):
+            window.update(candidates.get(local, [{}] * len(windows))[index])
+    for turn in turns:
+        local = turn.get('local_speaker') or turn['speaker']
+        turn['review_timing'] = turn_timing(turn, local_result.get('asr_diagnostics', []))
+        windows = public['windows'].get(local, [])
+        matched = [m['speaker'] for m in public['matches'] if m['local_speaker'] == local and m['status'] == 'matched']
+        turn.update(voice_hints(turn, windows, matched, public['matches']))
+    public["saved_status"] = snapshot(path, packet)
+    public["decisions_allowed"] = public["saved_status"]["decisions_allowed"]
+    public["draft_revision"] = stable_hash([public["draft_revision"], public["saved_status"]["snapshot_id"]])[:16]
     return public
 
 
@@ -210,16 +237,27 @@ def review_index(review_dir):
     registry = VoiceRegistry(Path(review_dir) / "speaker_registry.json")
     catalog = registry.profiles_for_review()
     recordings = []
+    manifest = ManifestStore(Path(review_dir) / 'transcription_manifest.json')
     for path in sorted(root.glob("*.json")):
-        packet = json.loads(path.read_text(encoding="utf-8"))
-        if packet.get("version") != 1:
-            continue
-        packet["profiles"] = catalog
-        if not packet.get("new_profile_ids"):
-            packet["new_profile_ids"] = registry.reviewed_profile_ids(packet.get("receipts", []))
-        packet["matches"] = packet["payload"].get("speaker_identity", {}).get("matches", packet["matches"])
-        render_review(path, packet)
-        recordings.append(review_data(path, packet))
+        status = inspect_packet(path, manifest=manifest)
+        try:
+            packet = json.loads(path.read_text(encoding="utf-8"))
+            if not status['decisions_allowed']:
+                raise ValueError('blocked source')
+            packet["profiles"] = catalog
+            if not packet.get("new_profile_ids"):
+                packet["new_profile_ids"] = registry.reviewed_profile_ids(packet.get("receipts", []))
+            packet["matches"] = packet["payload"].get("speaker_identity", {}).get("matches", packet["matches"])
+            public = review_data(path, packet)
+        except (OSError, ValueError, KeyError, TypeError, AttributeError, RuntimeError):
+            public = {"review_id": "blocked", "packet": path.name, "source": status['source'],
+                      "profiles": catalog, "pending": [], "matches": [], "turns": [],
+                      "windows": {}, "mixed": [], "applied_decisions": {},
+                      "decisions_allowed": False, "draft_revision": stable_hash(status)[:16],
+                      "saved_status": {**status, "generated_utc": utc_now(),
+                                       "snapshot_id": stable_hash(status)[:16], "program_version": __version__}}
+        render_review(path, public=public)
+        recordings.append(public)
     index = root / "index.html"
     if recordings:
         recordings.sort(key=lambda item: (not item["pending"], item["source"]))
@@ -230,7 +268,7 @@ def review_index(review_dir):
             for batch in state.get("batches", {}).values():
                 for key, value in registry.resolve_profile_ids(batch.get("new_profile_ids", {})).items():
                     aliases[key] = value if key not in aliases or aliases[key] == value else None
-        render_review(index, public={"kind": "speaker_review_batch", "batch_id": batch_digest(recordings),
+        render_review(index, public={"kind": "speaker_review_batch", "batch_id": batch_digest([item for item in recordings if item.get("decisions_allowed", True)]),
                                      "recordings": recordings, "profiles": catalog,
                                      "new_profile_ids": {key: value for key, value in aliases.items() if value}})
     else:
@@ -252,9 +290,15 @@ def _resolve_choices(packet, decisions):
         raise SpeakerRegistryError("review references a speaker or turn absent from this recording")
     if not assignments and not overrides and not decisions.get("range_overrides") and not decisions.get("profile_updates") and decisions.get("format_version") != 2:
         raise SpeakerRegistryError("review contains no decisions")
+    word_index = -1
     for turn in turns:
         local = str(turn.get("local_speaker") or turn["speaker"])
         turn["review_choice"] = overrides.get(turn["id"], assignments.get(local))
+        turn['untimed_word_choices'] = {}
+        for word in turn.get('words', []):
+            word_index += 1
+            if (word.get('start') is None or word.get('end') is None) and turn['id'] in overrides:
+                turn['untimed_word_choices'][word_index] = overrides[turn['id']]
     expanded = []
     ranges = decisions.get("range_overrides", [])
     if not isinstance(ranges, list):
@@ -313,10 +357,16 @@ def _review_references(packet, turns, excluded):
 
 
 def apply_review(review_dir, decision_path):
-    decisions = json.loads(Path(decision_path).read_text(encoding="utf-8"))
-    if isinstance(decisions, dict) and decisions.get("kind") == "speaker_review_batch":
-        return apply_batch_review(review_dir, decisions)
-    return _apply_recording_review(review_dir, decisions)
+    try:
+        decisions = json.loads(Path(decision_path).read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise SpeakerRegistryError(f"Decision file {Path(decision_path).name} is unreadable or malformed; export a fresh JSON file from the current review index.") from exc
+    try:
+        if isinstance(decisions, dict) and decisions.get("kind") == "speaker_review_batch":
+            return apply_batch_review(review_dir, decisions)
+        return _apply_recording_review(review_dir, decisions)
+    except SpeakerRegistryError as exc:
+        raise SpeakerRegistryError(f"Decision file {Path(decision_path).name}: {exc}") from exc
 
 
 def apply_batch_review(review_dir, decisions):
@@ -397,7 +447,7 @@ def apply_batch_review(review_dir, decisions):
         raise
     return {"batch": True, "created_profiles": created, "reviews_applied": len(reviews),
             "references_saved": sum(item.get("references_saved", 0) for item in applied),
-            "pending": sum(item["pending"] for item in refreshed["recordings"]),
+            "pending": sum(item["pending"] or 0 for item in refreshed["recordings"]),
             "recordings_refreshed": refreshed["recordings"], "review_index": refreshed["review_index"]}
 
 
@@ -409,12 +459,18 @@ def _validated_review_packet(review_dir, decisions):
         raise SpeakerRegistryError("invalid speaker review packet name")
     path = Path(review_dir) / "speaker-reviews" / packet_name
     packet = json.loads(path.read_text(encoding="utf-8"))
-    if packet_digest(packet) != packet.get("review_id") or decisions.get("review_id") != packet["review_id"]:
-        raise SpeakerRegistryError("this review is stale or its source evidence has changed; reopen the latest review")
+    status = inspect_packet(path, packet, manifest=ManifestStore(Path(review_dir) / 'transcription_manifest.json'))
+    if not status['decisions_allowed'] or decisions.get('review_id') != packet.get('review_id'):
+        state = status['state'] if not status['decisions_allowed'] else 'decision_file_stale'
+        previous = packet.get('prior_review_fingerprints', {}).get(decisions.get('review_id'))
+        stored = short_fingerprint(previous) if previous else status.get('stored_fingerprint')
+        mismatch = 'metadata-only recovery; obsolete decision export' if previous and same_content(previous, packet['fingerprint']) else state
+        raise SpeakerRegistryError(
+            f"source recording changed or review is stale: {packet.get('source_key', path.name)}; "
+            f"state={state}; mismatch={mismatch}; stored={stored}; current={status.get('current_fingerprint', 'unavailable')}; "
+            f"{status['action']} Run ./transcribe-media --review-speakers, reopen its index, and export a NEW decisions file.")
     if packet["embedding_model"] != {"name": SPEAKER_EMBEDDING_MODEL, "revision": SPEAKER_EMBEDDING_REVISION}:
         raise SpeakerRegistryError("review references use a different embedding model; regenerate them with the current model")
-    if source_fingerprint(Path(packet["source"])) != packet["fingerprint"]:
-        raise SpeakerRegistryError("source recording changed after this review was created")
     return packet
 
 
@@ -423,7 +479,7 @@ def _apply_recording_review(review_dir, decisions, *, managed=False):
     path = Path(review_dir) / "speaker-reviews" / decisions["packet"]
     receipt = stable_hash(decisions)
     if packet.get("receipts", [])[-1:] == [receipt]:
-        return {"already_applied": True, "pending": len(packet["pending"])}
+        return {"already_applied": True, "pending": pending_count(packet["payload"])}
     # A second import updates the same source's decisions rather than erasing prior review.
     if decisions.get("format_version") not in (None, 2):
         raise SpeakerRegistryError("unsupported review decision format")
@@ -488,6 +544,8 @@ def _apply_recording_review(review_dir, decisions, *, managed=False):
         packet.setdefault("new_profile_ids", {}).update(created)
         for turn in turns:
             turn["review_choice"] = created.get(turn["review_choice"], turn["review_choice"])
+            turn['untimed_word_choices'] = {i: created.get(choice, choice)
+                                           for i, choice in turn.get('untimed_word_choices', {}).items()}
         for key in ("assignments", "turn_overrides"):
             combined[key] = {local: created.get(choice, choice) for local, choice in combined[key].items()}
         for item in combined["range_overrides"]:
@@ -510,6 +568,8 @@ def _apply_recording_review(review_dir, decisions, *, managed=False):
         segments = result["segments"]
         # Apply against original local labels, preserving the recognized words.
         apply_turn_choices(result, turns, packet["review_id"], receipt)
+        from .timing import annotate_word_timing
+        annotate_word_timing(result)
         normalized = normalize_segments({"segments": segments})
         result["segments"] = normalized
         result["turns"] = build_turns(normalized)
@@ -517,17 +577,19 @@ def _apply_recording_review(review_dir, decisions, *, managed=False):
         from .analysis import annotate_raw_overlap
         annotate_raw_overlap(result["turns"], result.get("speaker_timeline", []))
         update_overlap_events(result)
-        # Turn boundaries changed: old tone/acoustic estimates no longer describe them.
+        from .emotion import preserve_tone
+        preserve_tone(packet['payload'].get('turns', []), result['turns'], registry.profiles_for_review())
+        # Reuse contained tone windows; changed boundaries need fresh acoustic analysis.
         result["human_review"] = {"review_id": packet["review_id"], "applied_utc": utc_now(),
                                   "receipt": receipt, "decisions": combined,
-                                  "acoustic_and_tone_recompute_required": True}
+                                  "acoustic_recompute_required": True, "contained_tone_windows_preserved": True}
         result["processing"]["provenance"]["human_review"] = result["human_review"]
         packet["applied_decisions"] = combined
         packet.setdefault("receipts", []).append(receipt)
-        pending = [item["local_speaker"] for item in result["speaker_identity"].get("matches", [])
-                   if item["status"].startswith("unresolved")]
-        packet["pending"] = pending
-        result["speaker_review"] = {"pending": pending, "review_file": str(path.with_suffix(".html"))}
+        from .timing import pending_review
+        result['speaker_review'] = {**pending_review(result, packet['evidence'], registry), 'review_file': str(path.with_suffix('.html'))}
+        pending = result['speaker_review']['pending']
+        packet['pending'] = pending
         result.setdefault("speaker_identity", {})["human_review_applied"] = True
         summary = registry.validate()
         result["speaker_identity"].update(profile_count=summary["profile_count"], registry_revision=summary["revision"],
@@ -540,9 +602,9 @@ def _apply_recording_review(review_dir, decisions, *, managed=False):
         write_outputs(outputs, result)
         manifest.record_speaker_registry({"path": str(registry.path), **registry.validate()})
         entry["human_review"] = {"review_id": packet["review_id"], "pending": pending, "receipt": receipt}
-        entry["speaker_review_pending"] = len(pending)
+        entry["speaker_review_pending"] = pending_count(result)
         if not entry.get("retry_recommended"):
-            entry["status"] = "awaiting_review" if pending else "complete"
+            entry["status"] = "awaiting_review" if pending_count(result) else "complete"
             entry["completion_state"] = True
         manifest.update(packet["source_key"], entry)
         atomic_write_json(path, packet)
@@ -558,12 +620,13 @@ def _apply_recording_review(review_dir, decisions, *, managed=False):
         raise
     if not managed:
         review_index(review_dir)
-    return {"created_profiles": created, "pending": len(pending), "references_saved": len(references),
+    return {"created_profiles": created, "pending": pending_count(result), "references_saved": len(references),
             "profiles_needing_audio": [profile["voice_id"] for profile in packet["profiles"] if profile["training_status"] != "ready"],
             "outputs": {key: str(value) for key, value in outputs.items()}}
 
 
 def _sync_profile_labels(manifest, catalog, summary, current_path):
+    from .emotion import gate_turns
     for entry in manifest.data["sources"].values():
         files = {key: Path(value) for key, value in entry.get("outputs", {}).items()}
         if "json" not in files or not files["json"].exists():
@@ -571,6 +634,7 @@ def _sync_profile_labels(manifest, catalog, summary, current_path):
         payload = json.loads(files["json"].read_text(encoding="utf-8"))
         active = {turn["speaker"] for turn in payload.get("turns", [])}
         payload["speaker_profiles"] = [item for item in catalog if item["voice_id"] in active]
+        gate_turns(payload.get('turns', []), catalog)
         payload.setdefault("speaker_identity", {}).update(profile_count=summary["profile_count"],
             registry_revision=summary["revision"], registry_state_hash=summary["state_hash"])
         write_outputs(files, payload)
@@ -579,6 +643,7 @@ def _sync_profile_labels(manifest, catalog, summary, current_path):
         packet["profiles"] = catalog
         active = {turn["speaker"] for turn in packet["payload"].get("turns", [])}
         packet["payload"]["speaker_profiles"] = [item for item in catalog if item["voice_id"] in active]
+        gate_turns(packet['payload'].get('turns', []), catalog)
         atomic_write_json(path, packet)
         render_review(path, packet)
 
@@ -586,6 +651,7 @@ def _sync_profile_labels(manifest, catalog, summary, current_path):
 def merge_project_profiles(review_dir, duplicate, canonical):
     """An explicit human merge keeps an alias and updates all registered outputs."""
     review_dir = Path(review_dir)
+    from .emotion import gate_turns
     registry = VoiceRegistry(review_dir / "speaker_registry.json")
     manifest = ManifestStore(review_dir / "transcription_manifest.json")
     packets = list((review_dir / "speaker-reviews").glob("*.json"))
@@ -614,6 +680,7 @@ def merge_project_profiles(review_dir, duplicate, canonical):
             active = sorted({turn["speaker"] for turn in payload.get("turns", [])})
             payload.setdefault("speaker_identity", {}).update(active_speaker_ids=active, active_speaker_count=len(active))
             payload["speaker_profiles"] = [profile for profile in registry.profiles_for_review() if profile["voice_id"] in active]
+            gate_turns(payload.get('turns', []), payload['speaker_profiles'])
             payload.setdefault("identity_merges", []).append({"duplicate": duplicate, "canonical": canonical, "at": utc_now()})
             write_outputs(files, payload)
         for path in packets:
@@ -623,6 +690,9 @@ def merge_project_profiles(review_dir, duplicate, canonical):
                 if key in packet:
                     packet[key] = relabel(packet[key])
             packet["profiles"] = registry.profiles_for_review()
+            active = {turn['speaker'] for turn in packet['payload'].get('turns', [])}
+            packet['payload']['speaker_profiles'] = [p for p in packet['profiles'] if p['voice_id'] in active]
+            gate_turns(packet['payload'].get('turns', []), packet['profiles'])
             atomic_write_json(path, packet)
             render_review(path, packet)
         manifest.record_speaker_registry({"path": str(registry.path), **registry.validate()})
@@ -639,66 +709,81 @@ def refresh_reviews(review_dir, *, managed=False, allow_empty=False):
     catalog = VoiceRegistry(registry_path).profiles_for_review()
     if not catalog and not allow_empty:
         raise SpeakerRegistryError("confirm the first voice profiles before refreshing matches")
-    manifest = ManifestStore(review_dir / "transcription_manifest.json")
     refreshed = []
     for path in sorted((review_dir / "speaker-reviews").glob("*.json")):
-        packet = json.loads(path.read_text(encoding="utf-8"))
-        if packet_digest(packet) != packet.get("review_id"):
-            raise SpeakerRegistryError(f"review evidence was modified: {path}")
-        if source_fingerprint(Path(packet["source"])) != packet["fingerprint"]:
-            raise SpeakerRegistryError(f"recording changed after review: {packet['source_key']}")
-        entry = manifest.get(packet["source_key"])
-        if not entry or entry.get("source_fingerprint") != packet["fingerprint"]:
-            raise SpeakerRegistryError("review and processing manifest no longer agree")
-        settings = packet["payload"]["processing"].get("settings", {})
-        registry = VoiceRegistry(registry_path, reviewed=True, learn=not bool(catalog),
-                                 known_voices=settings.get("known_voices", ()),
-                                 match_threshold=settings.get("speaker_match_threshold", .45),
-                                 match_margin=settings.get("speaker_match_margin", .12))
-        result = copy.deepcopy(packet["local_result"])
-        timeline = result.get("speaker_timeline", [])
-        labels = sorted({item["speaker"] for item in timeline if item.get("speaker") not in (None, "SPEAKER_UNKNOWN")})
-        report = registry.identify(source_key=packet["source_key"], source_fingerprint=packet["fingerprint"]["sha256"],
-                                   local_speakers=labels, evidence=packet["evidence"],
-                                   incompatible_pairs=overlapping_speaker_pairs(timeline))
-        apply_speaker_identities(result, report)
-        if packet.get("applied_decisions"):
-            apply_turn_choices(result, _resolve_choices(packet, packet["applied_decisions"]), packet["review_id"])
-        payload = copy.deepcopy(packet["payload"])
-        payload["segments"] = normalize_segments(result)
-        payload["turns"] = build_turns(payload["segments"])
-        payload["speaker_timeline"] = result.get("speaker_timeline", [])
-        payload["speaker_assignment_timeline"] = result.get("speaker_assignment_timeline")
-        payload["speaker_identity"] = result["speaker_identity"]
-        active_ids = {turn["speaker"] for turn in payload["turns"]}
-        payload["speaker_profiles"] = [profile for profile in catalog if profile["voice_id"] in active_ids]
-        annotate_speaker_attribution(payload["turns"], result.get("speaker_refinement"))
-        from .analysis import annotate_raw_overlap
-        annotate_raw_overlap(payload["turns"], payload["speaker_timeline"])
-        update_overlap_events(payload)
-        pending = [item["local_speaker"] for item in result["speaker_identity"]["matches"]
-                   if item["status"].startswith("unresolved")]
-        payload["speaker_review"] = {"pending": pending, "review_file": str(path.with_suffix(".html"))}
-        payload["processing"]["provenance"]["voice_refresh"] = {"at": utc_now(), "registry_revision": report["registry_revision"],
-                                                                    "acoustic_and_tone_recompute_required": True}
-        outputs = {key: Path(value) for key, value in entry["outputs"].items()}
-        transaction = StateTransaction(review_dir, [manifest.path, path, path.with_suffix(".html"), *outputs.values()])
-        if not managed:
-            transaction.begin()
+        manifest = ManifestStore(review_dir / "transcription_manifest.json")
+        status = inspect_packet(path, manifest=manifest)
         try:
-            write_outputs(outputs, payload)
-            packet.update(payload=payload, pending=pending, profiles=catalog, matches=report["matches"])
-            atomic_write_json(path, packet)
-            render_review(path, packet)
-            entry["speaker_review_pending"] = len(pending)
-            if not entry.get("retry_recommended"):
-                entry.update(status="awaiting_review" if pending else "complete", completion_state=True)
-            manifest.update(packet["source_key"], entry)
-            if not managed:
-                transaction.commit()
-        except BaseException:
-            if not managed:
-                transaction.rollback()
-            raise
-        refreshed.append({"source": packet["source_key"], "pending": len(pending)})
-    return {"recordings": refreshed, "review_index": str(Path(review_dir) / "speaker-reviews/index.html") if managed else str(review_index(review_dir))}
+            if not status['decisions_allowed']:
+                if status['state'] in ('source_content_changed', 'source_unavailable'):
+                    from .recovery import recover_review
+                    recover_review(review_dir, status['source'], quarantine=True, managed=managed)
+                refreshed.append(status)
+                continue
+            packet = json.loads(path.read_text(encoding="utf-8"))
+            _refresh_recording(review_dir, path, packet, manifest, registry_path, catalog, managed)
+            refreshed.append(inspect_packet(path, manifest=manifest))
+        except (OSError, ValueError, RuntimeError, KeyError, TypeError, AttributeError):
+            if managed:
+                raise
+            refreshed.append({**status, 'state': 'recovery_required', 'decisions_allowed': False,
+                              'action': 'Refresh failed; previous state restored. Check file permissions and diagnose this source.'})
+    return {"recordings": refreshed, "review_index": str(review_dir / "speaker-reviews/index.html") if managed else str(review_index(review_dir))}
+
+
+def _refresh_recording(review_dir, path, packet, manifest, registry_path, catalog, managed):
+    entry = manifest.get(packet['source_key'])
+    settings = packet["payload"]["processing"].get("settings", {})
+    registry = VoiceRegistry(registry_path, reviewed=True, learn=not bool(catalog),
+                             known_voices=settings.get("known_voices", ()),
+                             match_threshold=settings.get("speaker_match_threshold", .45),
+                             match_margin=settings.get("speaker_match_margin", .12))
+    result = copy.deepcopy(packet["local_result"])
+    timeline = result.get("speaker_timeline", [])
+    labels = sorted({item["speaker"] for item in timeline if item.get("speaker") not in (None, "SPEAKER_UNKNOWN")})
+    report = registry.identify(source_key=packet["source_key"], source_fingerprint=packet["fingerprint"]["sha256"],
+                               local_speakers=labels, evidence=packet["evidence"],
+                               incompatible_pairs=overlapping_speaker_pairs(timeline))
+    apply_speaker_identities(result, report)
+    if packet.get("applied_decisions"):
+        apply_turn_choices(result, _resolve_choices(packet, packet["applied_decisions"]), packet["review_id"])
+    payload = copy.deepcopy(packet["payload"])
+    from .timing import annotate_word_timing
+    annotate_word_timing(result)
+    payload["segments"] = normalize_segments(result)
+    payload["turns"] = build_turns(payload["segments"])
+    payload["speaker_timeline"] = result.get("speaker_timeline", [])
+    payload["speaker_assignment_timeline"] = result.get("speaker_assignment_timeline")
+    payload["speaker_identity"] = result["speaker_identity"]
+    active_ids = {turn["speaker"] for turn in payload["turns"]}
+    payload["speaker_profiles"] = [profile for profile in catalog if profile["voice_id"] in active_ids]
+    annotate_speaker_attribution(payload["turns"], result.get("speaker_refinement"))
+    from .analysis import annotate_raw_overlap
+    annotate_raw_overlap(payload["turns"], payload["speaker_timeline"])
+    update_overlap_events(payload)
+    from .emotion import preserve_tone
+    preserve_tone(packet['payload'].get('turns', []), payload['turns'], catalog)
+    from .timing import pending_review
+    payload['speaker_review'] = {**pending_review(payload, packet['evidence'], registry), 'review_file': str(path.with_suffix('.html'))}
+    pending = payload['speaker_review']['pending']
+    payload["processing"]["provenance"]["voice_refresh"] = {"at": utc_now(), "registry_revision": report["registry_revision"],
+                                                                "acoustic_recompute_required": True, "contained_tone_windows_preserved": True}
+    outputs = {key: Path(value) for key, value in entry["outputs"].items()}
+    transaction = StateTransaction(review_dir, [manifest.path, path, path.with_suffix(".html"), *outputs.values()])
+    if not managed:
+        transaction.begin()
+    try:
+        write_outputs(outputs, payload)
+        packet.update(payload=payload, pending=pending, profiles=catalog, matches=report["matches"])
+        atomic_write_json(path, packet)
+        render_review(path, packet)
+        entry["speaker_review_pending"] = pending_count(payload)
+        if not entry.get("retry_recommended"):
+            entry.update(status="awaiting_review" if pending_count(payload) else "complete", completion_state=True)
+        manifest.update(packet["source_key"], entry)
+        if not managed:
+            transaction.commit()
+    except BaseException:
+        if not managed:
+            transaction.rollback()
+        raise

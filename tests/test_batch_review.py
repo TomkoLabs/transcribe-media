@@ -67,6 +67,7 @@ class BatchReviewTests(unittest.TestCase):
             atomic_write_json(target, batch)
             result = apply_review(review, target)
             self.assertEqual(len(result['recordings_refreshed']), 3)
+            # Timing notes remain available without undoing strong identity matches.
             self.assertEqual(result['pending'], 0)
             for i in (0, 2):
                 payload = json.loads(outputs[i]['json'].read_text())

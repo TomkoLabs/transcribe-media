@@ -23,6 +23,8 @@ def transcribe_cached(backend, source, fingerprint, settings, args):
             if cached["key"] == key and isinstance(cached["result"].get("segments"), list):
                 audio = backend._decode_audio(source)
                 cached["provenance"]["asr_alignment_cache_hit"] = True
+                from .timing import annotate_word_timing
+                annotate_word_timing(cached['result'])
                 return cached["result"], audio, cached["provenance"], []
         except (KeyError, ValueError, TypeError):
             pass

@@ -5,7 +5,8 @@ introduced the reviewed-reference matcher and offline review workflow.
 The recommended scenario is two adults with an occasional child. For a recording
 or excerpt with only one speaker, explicitly use `--speakers 1` (or allow a range
 with `--min-speakers 1 --max-speakers 3`). The software does not infer a
-person's age, relationship, emotion or identity from their transcript.
+person's age, relationship or identity from their transcript. Optional text context
+includes conservative estimates of vocal expression from audio, described below.
 
 ## Start here
 
@@ -33,9 +34,9 @@ measured claim of lower WER on your recordings. ASR diagnostic scores remain in
 JSON. Audio enhancement and text rewriting are not applied.
 
 The preset allows **2–3 speakers**, uses ASR batch size 1, enables the reviewed
-reference workflow, and disables inferred vocal tone by default. Measured timing
-and acoustic observations remain available. Use `--tone-backend emotion2vec`
-explicitly if that optional estimate is wanted. Do not use `--speakers 2` when
+reference workflow, and enables selective emotion2vec+ Large vocal-emotion
+estimates. Measured timing and acoustic observations remain available. Use
+`--no-tone` to opt out. Do not use `--speakers 2` when
 a child might speak: an exact count can force three people into two labels.
 An exact count should be supplied only when known for every file in the batch.
 
@@ -49,8 +50,10 @@ The pages use sibling WAVs, so keep the review folder together. On a headless GX
 copy this review folder to your desktop for listening, then apply the exported
 decisions on the machine holding the original project and recordings.
 
-1. Start in **Needs attention**, which leaves uncertain groups unassigned.
-   **Already assigned** contains confident automatic matches and your selections.
+1. Start in **Needs attention**, which shows unassigned or flagged soundbites.
+   Use **Next soundbite needing attention** to move through them and across files.
+   Confident, unflagged turns are already assigned; **All voices** also shows them.
+   **Already assigned** contains fully resolved groups.
    Listen to clips from several parts of each local speaker group. A diarizer's
    group can contain mistakes; a good first clip does not verify the whole group.
 2. Select an existing VOICE ID if it is the same person. Otherwise choose
@@ -58,7 +61,10 @@ decisions on the machine holding the original project and recordings.
    The role is your annotation; it is not an automated child detector.
 3. Each clip card displays its timestamp, excerpt and assigned person. If a group
    mixes people, use **Change only this clip** for an exception, or expand
-   **All soundbites** and correct a whole turn or part of it. Multiple time
+   **All voices** and correct a whole soundbite or part of it.
+   A group default applies only to unflagged speech; unreviewed timing/overlap/voice
+   exceptions remain unknown until you choose individually. Existing manual
+   decisions, including older group decisions, are retained. Multiple time
    corrections can be added and removed in the page. Existing word timestamps
    determine assignment by word midpoint; corrections do not rewrite words.
 4. Uncheck clips with the wrong speaker, overlap, noise or unsuitable content.
@@ -85,8 +91,10 @@ afterward to propagate improved profiles. Strong matches are applied automatical
 unresolved matches stay in the queue. There is no automatic equivalence between
 the same local SPEAKER number in different recordings. Choose the same shared
 person only after listening; processing order need not determine enrollment.
-Refresh and review application leave old per-turn tone/acoustic estimates out
-when rebuilding turns; a normal processing run recomputes them.
+Refresh and review application preserve emotion windows wholly contained within
+the rebuilt speaker turns and recheck adult roles. Windows crossing a corrected
+speaker boundary are dropped. Use `--refresh-context` to recompute all acoustic
+and emotion context afterward without changing text, speaker decisions or profiles.
 
 New identities are **never automatically enrolled in quality mode**. Until reviewed,
 the transcript is labeled `DRAFT: SPEAKER REVIEW REQUIRED`, and the manifest records
@@ -145,13 +153,83 @@ and click **Set time correction**. Saved corrections also have a Listen button.
 Marking or previewing alone does not apply a correction. Boundaries must remain
 inside the soundbite; word midpoints determine which words change speaker.
 Wider playback helps locate speech, but does not repair inaccurate word alignment.
+Timing notes alone do not revoke a confident identity or require another speaker choice.
 
 Groups become **Chosen by you** when all their spoken words have explicit choices;
 small unassigned pauses or trimmed clip edges do not hold the group pending.
 Reference-clip progress is shown separately: reviewing every sampled clip may
 still leave other words unassigned. When all samples have the same person, use
 **Assign remaining speech to …** after checking for exceptions. This is an
-explicit whole-group confirmation; sample labels are never silently propagated.
+explicit default for unflagged speech; flagged soundbites remain for individual
+review, and sample labels are never silently propagated.
+
+### Word/audio links
+
+New quality transcriptions save Whisper's word boundaries and original ASR sentence
+ranges alongside forced-alignment times in the existing detailed JSON. Alignment
+remains authoritative for speaker corrections; disagreements over 0.75 seconds,
+weak alignment scores, missing/zero timings, stretched words and weak ASR support
+are flagged for listening. These are review heuristics, not measured confidence.
+
+Click a word to hear its aligned position. **Listen to source sentence** plays the
+recognizer's original sentence range, which can help locate words when alignment
+drifted. The alternate playback never expands a correction or voice-training clip.
+Reference-clip excerpts include only fully contained aligned words; a sentence
+extending outside the clip is no longer presented as that clip's text. Old caches
+can use their saved sentence anchors without fresh transcription; independent
+Whisper word comparisons require new ASR. No duplicate timing sidecar is needed.
+An unaligned word has no playable word button. Assign its whole soundbite explicitly
+after listening to the source sentence; group defaults and partial time corrections
+cannot place that word. The assignment preserves the missing timestamp rather
+than inventing one.
+
+This improves traceability rather than guaranteeing every word is audible: ASR
+can hallucinate, and neither timing system resolves all overlapping/faint speech.
+Larger alignment models are not an established fix for these cases.
+[WhisperX alignment and limitations](https://github.com/m-bain/whisperX)
+
+### Selective vocal-emotion context
+
+Quality mode uses the pinned **emotion2vec+ Large** checkpoint already supported
+by the installer (about 300 million parameters). It analyzes real contiguous
+speech windows, up to 12 seconds, excluding detected overlap with a boundary guard.
+A brief overlap need not suppress clean speech elsewhere in the same turn.
+
+Primary text uses **[Vocal tone estimate: …]** only when an adult profile is
+assigned and both the original window and a central crop agree on a non-neutral
+emotion with model score at least 0.85 and margin at least 0.30. Each eligible
+window needs at least 2.5 seconds, sufficient waveform energy and aligned speech
+coverage, no severe clipping, and no flagged word timing. Partial coverage is
+labelled as part of the passage. Child/unspecified roles, faint or mixed speech,
+neutral/unknown output and inconsistent scores produce no emotion label.
+
+These thresholds are conservative engineering filters, **not calibrated emotion
+probabilities or validated clinical accuracy**. Loudness alone cannot establish
+anger. Emotion datasets and recording conditions differ; even strong agreement
+can be wrong. Absence of a label means abstention, not proof of neutrality.
+The model uses audio, not transcript-based speculation about intent or diagnoses.
+Raw scores, accepted windows and suppression reasons stay in detailed JSON.
+[Official model card](https://huggingface.co/emotion2vec/emotion2vec_plus_large)
+
+Initial recordings without adult profiles retain model windows so applying adult
+speaker labels can reveal eligible estimates. Speaker review and voice refresh
+reuse only windows that remain wholly within the resulting speaker turn. Use:
+
+```bash
+./transcribe-media --prepare-models   # online once if weights are missing
+./transcribe-media --refresh-context
+```
+
+Context refresh reads saved review WAVs, preserves words/times/identity decisions,
+updates outputs and regenerates review pages. A failed refresh rolls back its
+changes. It does not rerun ASR, train profiles or change review IDs. Existing saved
+decisions remain usable when the original source/evidence are unchanged. A full
+reinstall is unnecessary for 1.15.0 because the model dependencies were already
+included. Model-free UI regeneration is still `--review-speakers`.
+
+Emotion computation defaults to CPU on the 3080 setup, adding time and system RAM
+use while leaving the ASR GPU budget unchanged. Quality mode reports a degraded
+run if the estimator fails; it does not substitute a weaker emotion model.
 
 ### Save drafts and manage people
 
@@ -187,6 +265,51 @@ themselves. To add references for an already confident person, listen and use
 **Confirm this person & learn**. An uncertain group's explicit assignment approves
 its selected suitable references; clip/turn corrections take precedence. A window
 crossing different or unresolved identities cannot train a profile.
+
+## Why a well-trained voice might still need review
+
+The profile library stores verified acoustic references; it does not fine-tune the
+speaker model. More reviewed recording conditions can improve matching, but the
+number of reviewed videos alone does not guarantee a small queue. A new room,
+faint/overlapping speech or an actual mixed cluster can still require listening.
+
+Version 1.15.1 corrects three sources of unnecessary review:
+
+- A diarizer disagreement is distinct from an acoustic outlier. Older packets
+  combined both into a group-wide mixed flag. The matcher now derives these
+  separately without changing the saved evidence. A disputed group is accepted
+  only with the existing score/margin checks, at least two comparable samples,
+  80% comparable-window agreement, and 80% verified-reference agreement across
+  all samples, including disputed ones. The disputed intervals remain reviewable.
+- Several non-overlapping local clusters can independently match the same known
+  person. They remain separate detected clusters; there is no forced enrollment
+  or merging into an adult. Simultaneous clusters cannot automatically receive
+  the same person. If independently accepted clusters name the same person,
+  a secondary-diarizer label switch between them is not an identity conflict.
+  Ambiguous secondary evidence still requires review.
+- Word-timing/text warnings remain visible with playback controls, but do not
+  revoke a confident speaker identity by themselves. Genuine speaker conflicts,
+  unknown voices and unresolved overlapping speech remain in **Needs attention**.
+  Use **All voices** to inspect timing/text notes too.
+
+The page now shows the verified-reference scores used for matching and why a group
+was withheld. The older overall-centroid resemblance (for example, 0.936) was a
+suggestion, not necessarily the score that passed the reference-consensus rules.
+Neither score is a probability. **0 / 58 reference clips approved from this
+recording** does not mean references from earlier videos disappeared.
+
+Run `./transcribe-media --refresh-voices` after this update. It uses existing saved
+embeddings, preserves reviewed decisions and the registry, and regenerates all
+outputs/pages without ASR or new models. `--refresh-context` changes acoustic/emotion
+context only; it does not invoke voice rematching. Existing source-bound decisions
+remain compatible. The reference comparison is now batched to avoid repeatedly
+rebuilding every session's reference centroid as the library grows; scoring and
+acceptance thresholds are retained.
+
+No measured reduction in review count or speaker-error rate is claimed for your
+recordings. Regression fixtures verify that false group-wide blockers are removed
+while actual mixed evidence, ambiguous matches, child-role thresholds, known-voice
+rosters, manual exclusions and overlap conflicts remain protected.
 
 ## How the references improve
 
@@ -365,8 +488,10 @@ An end-to-end local sample completed on CPU with the full decoding fallback,
 alignment, token-free diarization, reference extraction and review generation.
 A subsequent run reused the ASR/alignment cache. The fallback produced three
 candidate groups, requiring review; this does not prove correct speaker separation.
-The review page's selection, clip playback and export controls were exercised
-using synthetic text and silent audio. GPU execution and independently measured WER/DER/
+The review page's selection, clip playback, alternate sentence playback, word
+playback, exception protection and batch navigation were exercised using synthetic
+text/audio. The installed emotion2vec model also passed a CPU inference smoke
+test with non-speech abstention; this does not measure emotion accuracy. GPU execution and independently measured WER/DER/
 cross-recording identity improvements remain unvalidated.
 
 ## TL;DR
@@ -379,3 +504,10 @@ Use `--no-speaker-learning` once the references are satisfactory. Keep
 uncertain child/overlap speech unresolved until reviewed; never force two speakers
 when three may be present. The quality workflow does not require a GPU larger
 than the existing 3080 target, and it does not use Ollama.
+
+## Recovering saved review state
+
+See [review recovery](docs/REVIEW_RECOVERY.md) for source-fingerprint diagnosis,
+private backups and targeted recovery. Generated pages show saved pending state
+and a snapshot time separately from unapplied browser edits. See the
+[reviewed TXT contract](docs/TXT_CONTRACT.md) before copying files downstream.

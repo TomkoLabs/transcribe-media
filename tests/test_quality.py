@@ -271,14 +271,18 @@ class IntegrityTests(unittest.TestCase):
         backend._decode_audio = mock.Mock(return_value=np.zeros(SAMPLE_RATE))
         backend.model = mock.Mock()
         backend.model.model.transcribe.return_value = ([SimpleNamespace(start=0., end=1., text="Hello", avg_logprob=-.2,
-            no_speech_prob=.01, compression_ratio=1., temperature=0.)], SimpleNamespace(language="en"))
+            no_speech_prob=.01, compression_ratio=1., temperature=0.,
+            words=[SimpleNamespace(start=.1,end=.6,word='Hello',probability=.9)])], SimpleNamespace(language="en"))
         result, _, provenance, degraded = backend.transcribe(Path("test.wav"), False, False)
         options = backend.model.model.transcribe.call_args.kwargs
         self.assertEqual(options["temperature"], (0., .2, .4, .6, .8, 1.))
         self.assertEqual(options["log_prob_threshold"], -1.)
+        self.assertTrue(options['word_timestamps'])
         backend.model.transcribe.assert_not_called()
         self.assertEqual(provenance["decoding_mode"], "sequential_temperature_fallback")
         self.assertEqual(result["asr_diagnostics"][0]["avg_logprob"], -.2)
+        self.assertEqual(result['asr_diagnostics'][0]['asr_words'][0],
+                         {'word':'Hello','start':.1,'end':.6,'probability':.9})
         self.assertEqual(degraded, [])
 
     def test_ambiguous_secondary_label_mapping_abstains(self):
@@ -307,7 +311,7 @@ class IntegrityTests(unittest.TestCase):
             encoder.extract.return_value = samples
             args = [str(root), "--extensions", "wav", "--device", "cpu",
                     "--review-dir", str(review), "--transcript-dir", str(root / "Transcribed"),
-                    "--diarization-backend", "speechbrain", "--no-acoustic", "--no-speaker-refinement"]
+                    "--diarization-backend", "speechbrain", "--no-acoustic", "--no-tone", "--no-speaker-refinement"]
             with mock.patch.object(cli, "resolve_runtime", return_value=runtime), \
                  mock.patch.object(cli.WhisperXBackend, "create", return_value=(backend, runtime)), \
                  mock.patch.object(cli, "create_diarizer", return_value=diarizer), \
@@ -367,7 +371,7 @@ class IntegrityTests(unittest.TestCase):
                 self.assertEqual(args.language, "en")
                 self.assertEqual(args.diarization_backend, "auto")
                 self.assertTrue(args.speaker_identity and args.align)
-                self.assertEqual((args.min_speakers, args.max_speakers, args.batch_size, args.tone_backend), (2, 3, 1, "off"))
+                self.assertEqual((args.min_speakers, args.max_speakers, args.batch_size, args.tone_backend), (2, 3, 1, "emotion2vec"))
 
     def test_quality_defaults_respect_explicit_speaker_counts(self):
         parser = cli.build_parser()

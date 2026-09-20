@@ -26,6 +26,12 @@
       throw Error('Start must be before end. Adjust the other boundary first.');
     return value;
   }
-  root.ReviewPlayback={padding,bounds,phase,mark};
+  function clipText(turns,start,end) {
+    const all=turns.flatMap(turn=>turn.words||[]);
+    const contained=all.filter(w=>Number.isFinite(w.start)&&Number.isFinite(w.end)&&w.end>w.start&&w.start>=start&&w.end<=end);
+    const partial=all.filter(w=>Number.isFinite(w.start)&&Number.isFinite(w.end)&&w.start<end&&w.end>start&&!contained.includes(w));
+    return {text:contained.map(w=>w.text||w.word||'').join(' '),partial:partial.length};
+  }
+  root.ReviewPlayback={padding,bounds,phase,mark,clipText};
   if(typeof module!=='undefined') module.exports=root.ReviewPlayback;
 })(globalThis);

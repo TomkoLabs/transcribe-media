@@ -313,13 +313,16 @@ class WhisperXBackend:
                         temperature=(0., 0.2, 0.4, 0.6, 0.8, 1.),
                         compression_ratio_threshold=2.4, log_prob_threshold=-1.,
                         no_speech_threshold=0.6, condition_on_previous_text=False,
+                        word_timestamps=True,
                         vad_filter=True, vad_parameters={"threshold": 0.35,
                             "min_speech_duration_ms": 100, "min_silence_duration_ms": 300,
                             "speech_pad_ms": 400},
                     )
                     segments = [{"start": segment.start, "end": segment.end, "text": segment.text,
                                  "avg_logprob": segment.avg_logprob, "no_speech_prob": segment.no_speech_prob,
-                                 "compression_ratio": segment.compression_ratio, "temperature": segment.temperature}
+                                 "compression_ratio": segment.compression_ratio, "temperature": segment.temperature,
+                                 "asr_words": [{"word": w.word, "start": w.start, "end": w.end,
+                                                "probability": w.probability} for w in getattr(segment, "words", None) or []]}
                                 for segment in decoded]
                     result = {"segments": segments, "language": info.language}
                 else:
@@ -433,6 +436,8 @@ class WhisperXBackend:
         }
         if diagnostics:
             result["asr_diagnostics"] = diagnostics
+            from .timing import annotate_word_timing
+            annotate_word_timing(result)
         return result, audio, provenance, degraded
 
     def _decode_audio(self, source: Path) -> Any:
@@ -2503,11 +2508,30 @@ class Emotion2VecToneEstimator(ToneEstimator):
                     if not labels or len(labels) != len(values):
                         raise RuntimeError("emotion2vec returned invalid scores")
                     weight = len(samples) / SAMPLE_RATE
+                    rms = float(np.sqrt(np.mean(samples.astype(np.float64) ** 2)))
+                    clipped = float(np.mean(np.abs(samples) >= .995))
+                    start_seconds, end_seconds = cursor / SAMPLE_RATE, window_end / SAMPLE_RATE
+                    speech = sum(max(0., min(end_seconds, w['end']) - max(start_seconds, w['start']))
+                                 for w in turn.get('words', []) if w.get('start') is not None and w.get('end') is not None)
+                    eligible = weight >= 2.5 and rms >= .016 and clipped <= .005 and speech / weight >= .5
+                    confirmation = []
+                    if eligible:
+                        trim = min(int(.15 * len(samples)), max(0, (len(samples) - 2 * SAMPLE_RATE) // 2))
+                        with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+                            check = self.classifier.generate(input=samples[trim:len(samples)-trim or None],
+                                granularity='utterance', extract_embedding=False, disable_pbar=True)
+                        if check and isinstance(check[0], dict):
+                            confirmation = self._rank_scores(check[0]['labels'], check[0]['scores'])
                     windows.append(
                         {
                             "start": round(cursor / SAMPLE_RATE, 3),
                             "end": round(window_end / SAMPLE_RATE, 3),
                             "scores": self._rank_scores(labels, values),
+                            "confirmation_scores": confirmation,
+                            "audio_eligible": eligible,
+                            "rms_dbfs": round(20 * float(np.log10(max(rms, 1e-12))), 2),
+                            "clipped_fraction": clipped,
+                            "speech_fraction": min(1., speech / weight),
                         }
                     )
                     for label, value in zip(labels, values, strict=True):

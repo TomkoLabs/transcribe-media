@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from .recovery import is_ready
+
 import math
 from html import escape
 from pathlib import Path
@@ -182,8 +184,6 @@ def render_detailed_txt(payload: dict[str, Any]) -> str:
 
 
 CONDENSED_MAX_PARAGRAPH_WORDS = 250
-CONDENSED_TONE_MIN_PROBABILITY = 0.65
-CONDENSED_TONE_MIN_MARGIN = 0.20
 CONDENSED_CONTEXT_LABELS = {
     "long pause before": "long pause before",
     "overlap": "overlapping speech",
@@ -192,40 +192,12 @@ CONDENSED_CONTEXT_LABELS = {
 }
 
 
-def _strong_tone_from_scores(scores: Any) -> str | None:
-    ranked = [item for item in (scores or []) if isinstance(item, dict)]
-    if not ranked:
-        return None
-    top = ranked[0]
-    label = str(top.get("label") or "unknown").lower()
-    probability = float(top.get("probability") or 0.0)
-    runner_up = (
-        float(ranked[1].get("probability") or 0.0) if len(ranked) > 1 else 0.0
-    )
-    if (
-        label in {"unknown", "unclassified", "neutral"}
-        or probability < CONDENSED_TONE_MIN_PROBABILITY
-        or probability - runner_up < CONDENSED_TONE_MIN_MARGIN
-    ):
-        return None
-    return label
-
-
 def _condensed_tone_signal(tone: Any) -> str | None:
     if not isinstance(tone, dict) or tone.get("kind") != "approximate_model_estimate":
         return None
-    if not tone.get("temporal_variation"):
-        return _strong_tone_from_scores(tone.get("scores"))
-
-    labels: list[str] = []
-    for window in tone.get("windows") or []:
-        label = _strong_tone_from_scores(window.get("scores"))
-        if label and (not labels or labels[-1] != label):
-            labels.append(label)
-    unique = list(dict.fromkeys(labels))
-    if len(unique) < 2:
-        return None
-    return f"varied ({' -> '.join(unique[:3])})"
+    # Only audio-supported, consistently strong estimates enter primary text.
+    # Historical raw scores remain in detailed review files.
+    return (tone.get('display') or {}).get('label')
 
 
 def _condensed_paragraphs(turns: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -316,7 +288,7 @@ def render_txt(payload: dict[str, Any]) -> str:
         display.append(("UNKNOWN" if voice == "SPEAKER_UNKNOWN" else voice)
                        + (f" ({'; '.join(annotations)})" if annotations else ""))
     lines = [
-        "DRAFT: SPEAKER REVIEW REQUIRED" if (payload.get("speaker_review") or {}).get("pending") else "ANALYSIS-READY TRANSCRIPT",
+        "ANALYSIS-READY TRANSCRIPT" if is_ready(payload) else "DRAFT: SPEAKER REVIEW REQUIRED",
         "=========================",
         f"Source: {source.get('relative_path') or source.get('path')}",
         f"Language: {language.get('output') or language.get('detected') or 'unknown'}",

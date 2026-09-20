@@ -5,7 +5,23 @@ from typing import Any
 
 from .schema import SAMPLE_RATE
 
-EVIDENCE_VERSION = "2.1"
+EVIDENCE_VERSION = "2.2"
+
+
+def identity_evidence_summary(item):
+    """Distinguish acoustic outliers from disagreement between diarizers.
+
+    Derive this for older packets too, without modifying source-bound evidence.
+    Opaque legacy mixed flags remain conservative when detail is unavailable.
+    """
+    windows = item.get('windows', [])
+    detailed = bool(windows) and all(isinstance(w.get('model_disagreement'), bool)
+                                    and isinstance(w.get('retained'), bool) for w in windows)
+    compared = [w for w in windows if not w.get('model_disagreement')]
+    outliers = sum(w.get('retained') is False for w in compared)
+    mixed = (len(compared) >= 3 and outliers / len(compared) > .20 + 1e-9) if detailed else bool(item.get('suspected_mixed_speakers'))
+    return {'mixed_voice_evidence': mixed, 'acoustic_outlier_windows': outliers,
+            'model_disputed_windows': sum(bool(w.get('model_disagreement')) for w in windows)}
 
 
 def extract_reference_evidence(audio, timeline, result, encode):
@@ -89,8 +105,8 @@ def extract_reference_evidence(audio, timeline, result, encode):
             window["cohesion_similarity"] = round(float(matrix[index] @ centroid), 4)
             window["retained"] = bool(keep[index])
             window["automatic_reference_eligible"] &= bool(keep[index])
-        rejected["outlier"] = int((~keep).sum())
-        mixed = len(windows) >= 3 and float(keep.mean()) < 0.80
+        rejected["outlier"] = int((~keep & eligible).sum())
+        mixed = identity_evidence_summary({'windows': windows})['mixed_voice_evidence']
         good = [window for window in windows if window["retained"]]
         evidence[speaker] = {
             "embedding": [round(float(value), 7) for value in centroid],

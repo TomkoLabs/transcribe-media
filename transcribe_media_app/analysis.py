@@ -64,11 +64,13 @@ def normalize_segments(result: dict[str, Any]) -> list[dict[str, Any]]:
                     "local_speaker": word.get("local_speaker"),
                     "diarization_speaker": word.get("diarization_speaker"),
                     "sortformer_speaker": word.get("sortformer_speaker"),
+                    "sortformer_ambiguous": word.get("sortformer_ambiguous", False),
                     "sortformer_model_speaker": word.get(
                         "sortformer_model_speaker"
                     ),
                     "speaker_refinement": word.get("speaker_refinement"),
                     "speaker_identity": word.get("speaker_identity"),
+                    "timing": word.get("timing"),
                     "speaker_assignment_fallback": word.get("speaker_assignment_fallback", not bool(word.get("speaker"))),
                 }
             )

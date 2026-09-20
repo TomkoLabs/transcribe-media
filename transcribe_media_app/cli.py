@@ -76,7 +76,8 @@ from .storage import (
 
 SAVED_RESULT_ACTIONS = (
     "review_speakers", "refresh_voices", "apply_speaker_review",
-    "merge_voices", "evaluate_voices", "render_transcripts",
+    "merge_voices", "evaluate_voices", "render_transcripts", "refresh_context",
+    "diagnose_reviews", "recover_review",
 )
 
 # Disable optional dependency telemetry before WhisperX imports pyannote. Model
@@ -245,11 +246,16 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--quality", action=argparse.BooleanOptionalAction, default=True,
         help=("quality preset (default: enabled): reviewed voice references, "
-              "2–3 speakers, full decoding, no inferred tone; --no-quality "
+              "2–3 speakers, full decoding, selective vocal-emotion estimates; --no-quality "
               "restores the legacy automatic-enrollment/batched workflow"),
     )
     parser.add_argument("--review-speakers", action="store_true", help="build the aggregated offline speaker review page without loading models")
     parser.add_argument("--render-transcripts", action="store_true", help="regenerate text/subtitle exports from saved JSON; preserve words, speakers and profiles without loading models")
+    parser.add_argument("--refresh-context", action="store_true", help="refresh acoustic/vocal-emotion context from review audio, preserving words, speaker decisions and profiles")
+    parser.add_argument("--diagnose-reviews", action="store_true", help="read-only source integrity and saved review status; no models")
+    parser.add_argument("--recover-review", metavar="SOURCE_KEY", help="back up and recover one exact saved source key; never runs transcription")
+    parser.add_argument("--relocated-source", metavar="PATH", help="with --recover-review: explicitly relocate identical media, retaining its logical source key")
+    parser.add_argument("--only-source", metavar="SOURCE_KEY", help="transcribe only this exact relative source key (or its explicitly recovered location)")
     parser.add_argument("--refresh-voices", action="store_true", help="rematch cached recordings against verified profiles without rerunning ASR")
     parser.add_argument("--apply-speaker-review", metavar="DECISIONS_JSON", help="apply a recording or batch review; batch reviews also rematch all cached transcripts without ASR")
     parser.add_argument("--merge-voices", nargs=2, metavar=("DUPLICATE_ID", "CANONICAL_ID"), help="merge a reviewed duplicate profile into a canonical ID and update transcripts")
@@ -441,13 +447,21 @@ def build_parser() -> argparse.ArgumentParser:
 def _validate_args(parser: argparse.ArgumentParser, args: argparse.Namespace) -> None:
     if sum(bool(getattr(args, key)) for key in (*SAVED_RESULT_ACTIONS, "doctor", "prepare_models", "configure")) > 1:
         parser.error("choose one maintenance action per command")
-    if args.dry_run and any(getattr(args, key) for key in SAVED_RESULT_ACTIONS):
+    if args.dry_run and not args.recover_review and any(getattr(args, key) for key in SAVED_RESULT_ACTIONS):
         parser.error("--dry-run previews transcription only; omit it when running a saved-result action")
+    if args.relocated_source and not args.recover_review:
+        parser.error("--relocated-source requires --recover-review")
+    if args.only_source:
+        key = Path(args.only_source)
+        if key.is_absolute() or '..' in key.parts or key.as_posix() != args.only_source:
+            parser.error("--only-source requires an exact relative source key")
+        if args.reset_speaker_registry or any(getattr(args, key) for key in SAVED_RESULT_ACTIONS):
+            parser.error("--only-source cannot reset the registry or run maintenance")
     if args.quality:
         if args.speakers is None and args.min_speakers is None and args.max_speakers is None:
             args.min_speakers, args.max_speakers = 2, 3
         if args.tone_backend == "auto":
-            args.tone_backend = "off"
+            args.tone_backend = "emotion2vec"
         if args.batch_size is None:
             args.batch_size = 1
     if args.language is None:
@@ -1512,8 +1526,8 @@ def process_one(
     if tone_estimator is not None:
         LOG.info("[%s] stage 6/7: approximate turn-level tone", relative)
         try:
-            tone_turns = [turn for turn in turns if not turn.get("acoustic_overlap")]
-            tone_estimator.estimate(audio, tone_turns)
+            from .emotion import estimate_clean_tone
+            tone_turns = estimate_clean_tone(tone_estimator, audio, turns)
             scored_turns = sum(
                 bool((turn.get("tone") or {}).get("scores")) for turn in turns
             )
@@ -1581,12 +1595,14 @@ def process_one(
         active_ids = {turn["speaker"] for turn in turns}
         payload["speaker_profiles"] = [profile for profile in voice_registry.profiles_for_review()
                                        if profile["voice_id"] in active_ids]
+    from .emotion import gate_turns
+    gate_turns(payload['turns'], payload.get('speaker_profiles', []))
     if settings.quality and voice_registry is not None:
         from .review import save_review, packet_path
         review_path = packet_path(resolve_paths(args).review_dir, relative.as_posix())
+        from .timing import pending_review
         payload["speaker_review"] = {
-            "pending": [item["local_speaker"] for item in (result.get("speaker_identity") or {}).get("matches", [])
-                        if item["status"].startswith("unresolved")],
+            **pending_review(payload, evidence, voice_registry),
             "review_file": str(review_path.with_suffix(".html")),
         }
         save_review(resolve_paths(args).review_dir, source, relative.as_posix(), fingerprint,
@@ -1668,6 +1684,13 @@ def _run_batch(args: argparse.Namespace) -> int:
         args.recursive,
         extensions,
     )
+    if args.only_source:
+        entry = ManifestStore(paths.review_dir / 'transcription_manifest.json').get(args.only_source) or {}
+        source = Path(entry.get('source_path') or paths.source_dir / args.only_source)
+        if not source.is_file():
+            print("Exact source unavailable; check --diagnose-reviews and --source-dir.", file=sys.stderr)
+            return 1
+        files = [source]
     print(f"Source: {paths.source_dir}")
     print(f"Primary transcripts: {paths.transcript_dir}")
     print(f"Review artifacts: {paths.review_dir}")
@@ -1807,10 +1830,10 @@ def _run_batch(args: argparse.Namespace) -> int:
     pending: list[tuple[Path, Path, dict[str, Any], dict[str, Path]]] = []
     skipped = 0
     for source in files:
-        relative = source.relative_to(paths.source_dir)
+        relative = Path(args.only_source) if args.only_source else source.relative_to(paths.source_dir)
         fingerprint = source_fingerprint(source)
         outputs = expected_outputs(
-            source,
+            paths.source_dir / relative if args.only_source else source,
             paths.source_dir,
             paths.transcript_dir,
             paths.review_dir,
@@ -1964,7 +1987,7 @@ def _run_batch(args: argparse.Namespace) -> int:
     except Exception as exc:
         initial_degraded.append(f"tone initialization: {_safe_error(exc)}")
         tone_estimator = None
-        if tone_name == "emotion2vec" and _available("speechbrain"):
+        if not settings.quality and tone_name == "emotion2vec" and _available("speechbrain"):
             try:
                 tone_estimator = create_tone_estimator(
                     "speechbrain", runtime.analysis_device
@@ -1977,7 +2000,7 @@ def _run_batch(args: argparse.Namespace) -> int:
                 initial_degraded.append(
                     f"tone fallback initialization: {_safe_error(fallback_exc)}"
                 )
-        if tone_estimator is None and settings.acoustic_analysis:
+        if not settings.quality and tone_estimator is None and settings.acoustic_analysis:
             tone_estimator = HeuristicToneEstimator()
             initial_degraded.append(
                 "tone: learned estimator unavailable; using low-confidence "
@@ -2034,7 +2057,8 @@ def _run_batch(args: argparse.Namespace) -> int:
             needs_retry = any(
                 item not in expected_degraded for item in (result.degraded_stages or [])
             )
-            review_pending = len((payload.get("speaker_review") or {}).get("pending", []))
+            from .recovery import pending_count
+            review_pending = pending_count(payload)
             manifest.update(
                 key,
                 {
@@ -2177,9 +2201,33 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         from . import review
         paths = resolve_paths(args)
         try:
+            if args.diagnose_reviews or (args.recover_review and args.dry_run):
+                from .recovery import diagnose_reviews, recover_review, diagnosis_lock
+                with diagnosis_lock(paths.review_dir):
+                    # Read-only: never creates a lock file or rolls back a journal.
+                    if (paths.review_dir / '.state-transaction.json').exists():
+                        print(json.dumps(diagnose_reviews(paths.review_dir), indent=2))
+                    elif args.diagnose_reviews:
+                        print(json.dumps(diagnose_reviews(paths.review_dir), indent=2))
+                    else:
+                        print(json.dumps(recover_review(paths.review_dir, args.recover_review,
+                            relocated_source=args.relocated_source, dry_run=True), indent=2))
+                return 0
             with project_lock(paths.review_dir):
                 StateTransaction(paths.review_dir).rollback()
-                if args.render_transcripts:
+                if args.recover_review:
+                    from .recovery import recover_review
+                    print(json.dumps(recover_review(paths.review_dir, args.recover_review,
+                        relocated_source=args.relocated_source), indent=2))
+                    print(f"Open: {review.review_index(paths.review_dir)}")
+                elif args.refresh_context:
+                    from .context import refresh_context
+                    runtime = resolve_runtime(args)
+                    os.environ['HF_HUB_OFFLINE'] = '1'
+                    os.environ['TRANSFORMERS_OFFLINE'] = '1'
+                    estimator = create_tone_estimator('emotion2vec', runtime.analysis_device)
+                    print(json.dumps(refresh_context(paths.review_dir, estimator, AcousticAnalyzer() if args.acoustic else None), indent=2))
+                elif args.render_transcripts:
                     from .exports import render_saved_transcripts
                     rendered = render_saved_transcripts(paths.review_dir)
                     print(f"Rendered {rendered['recordings_rendered']} recording(s), {rendered['files_written']} text/subtitle file(s) from saved JSON. Words, speakers and voice profiles are unchanged.")

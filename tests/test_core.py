@@ -197,6 +197,7 @@ class FormattingTests(unittest.TestCase):
                     "tone": {
                         "kind": "approximate_model_estimate",
                         "model": "emotion-model",
+                        "display": {"label": "angry"},
                         "scores": [
                             {"label": "angry", "probability": 0.82},
                             {"label": "neutral", "probability": 0.10},
@@ -214,6 +215,7 @@ class FormattingTests(unittest.TestCase):
                     "tone": {
                         "kind": "approximate_model_estimate",
                         "model": "emotion-model",
+                        "display": {"label": "angry"},
                         "scores": [
                             {"label": "angry", "probability": 0.78},
                             {"label": "unknown", "probability": 0.12},
@@ -289,7 +291,7 @@ class FormattingTests(unittest.TestCase):
         self.assertEqual(text.count("DRAFT: SPEAKER REVIEW REQUIRED"), 1)
         self.assertNotIn("speaker attribution uncertain", text)
 
-    def test_condensed_tone_reports_strong_temporal_change_without_scores(self):
+    def test_unaudited_historical_tone_stays_out_of_primary_text(self):
         payload = {
             "source": {"relative_path": "session.wav"},
             "language": {"output": "en"},
@@ -321,7 +323,7 @@ class FormattingTests(unittest.TestCase):
             ],
         }
         text = render_txt(payload)
-        self.assertIn("[Vocal tone estimate: varied (sad -> angry)]", text)
+        self.assertNotIn("[Vocal tone estimate:", text)
         self.assertNotIn("82%", text)
         self.assertNotIn("test-model", text)
 

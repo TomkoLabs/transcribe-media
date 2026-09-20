@@ -80,15 +80,34 @@
       }
     }
     groupChoice(local) { return this.assignments[local] || this.machine[local] || ''; }
+    turnRisk(turn) {
+      if(turn.identity_review_reasons)return turn.identity_review_reasons.length>0;
+      return turn.review_reasons ? turn.review_reasons.length>0 : turn.speaker_attribution?.status==='uncertain';
+    }
+    assignGroup(local, profile) {
+      // Preserve explicit exceptions. A new blanket choice cannot approve a
+      // disputed toddler/overlap/outlier interval without listening to it.
+      for(const turn of this.data.turns.filter(t=>(t.local_speaker||t.speaker)===local)) {
+        const chosen=this.spokenChoices(turn,true);
+        if(profile && this.turnRisk(turn) && chosen.some(v=>!v||v==='unknown') && !this.overrides[turn.id])
+          this.overrides[turn.id]='unknown';
+      }
+      if(profile)this.assignments[local]=profile;else delete this.assignments[local];
+    }
+    turnNeedsAttention(turn) {
+      return this.spokenChoices(turn).some(choice=>!choice||choice==='unknown');
+    }
+    pendingTurns() { return this.data.turns.filter(t=>this.turnNeedsAttention(t)); }
     choiceAt(turn, at, humanOnly=false) {
       return this.ranges.find(r=>r.turn_id===turn.id && r.start <= at &&
         (at < r.end || at===turn.end && r.end===turn.end))?.profile ||
-        this.overrides[turn.id] || (humanOnly?this.assignments[turn.local_speaker || turn.speaker]||'':this.groupChoice(turn.local_speaker || turn.speaker));
+        this.overrides[turn.id] || this.assignments[turn.local_speaker||turn.speaker] ||
+        (!humanOnly && !this.turnRisk(turn) ? this.machine[turn.local_speaker||turn.speaker]||'' : '');
     }
     spokenChoices(turn, humanOnly=false) {
       const units=turn.words?.length?turn.words:[turn];
       return [...new Set(units.map(unit=>Number.isFinite(unit.start)&&Number.isFinite(unit.end)?
-        this.choiceAt(turn,(unit.start+unit.end)/2,humanOnly):''))];
+        this.choiceAt(turn,(unit.start+unit.end)/2,humanOnly):this.overrides[turn.id]||''))];
     }
     clipChoices(local,start,end,humanOnly=false) {
       const values = new Set();
@@ -135,10 +154,7 @@
       return this.machine[local] ? 'matched' : 'pending';
     }
     needsAttention(local) {
-      if(this.status(local)==='pending')return true;
-      if(this.assignments[local])return false;
-      return this.data.turns.some(t=>(t.local_speaker||t.speaker)===local &&
-        t.speaker_attribution?.status==='uncertain' && this.spokenChoices(t,true).some(choice=>!choice||choice==='unknown'));
+      return this.data.turns.some(t=>(t.local_speaker||t.speaker)===local && this.turnNeedsAttention(t));
     }
     referenceProgress(local) {
       const clips=this.data.windows[local]||[];
@@ -186,10 +202,12 @@
     newKey(){let n=1;const prefix=this.batch?'new:batch:'+this.input.batch_id.slice(0,12)+':person-':'new:person-';
       while(this.newProfiles[prefix+n] || this.drafts.some(d=>(d.data.new_profile_ids||{})[prefix+n]))n++;return prefix+n;}
     export(){
-      if(!this.batch)return this.drafts[0].export();
+      const allowed=this.drafts.filter(d=>d.data.decisions_allowed!==false);
+      if(!allowed.length)throw Error('No current reviews can be exported. Follow the saved source recovery action.');
+      if(!this.batch)return allowed[0].export();
       return {kind:'speaker_review_batch',format_version:3,batch_id:this.input.batch_id,
         new_profiles:copy(this.newProfiles),profile_updates:copy(this.updates),
-        reviews:this.drafts.map(d=>({...d.export(),new_profiles:{},profile_updates:{}}))};
+        reviews:allowed.map(d=>({...d.export(),new_profiles:{},profile_updates:{}}))};
     }
     load(input){
       // Validate into temporary drafts so one bad recording cannot partially import.
@@ -197,6 +215,7 @@
       if(isBatch && (input.format_version!==3 || !Array.isArray(input.reviews) || !input.reviews.length))throw Error('Invalid batch review file.');
       const entries=isBatch?input.reviews:[input];
       if(entries.some(e=>!object(e)) || new Set(entries.map(e=>e.packet)).size!==entries.length)throw Error('Invalid or duplicate recordings in review file.');
+      if(entries.some(e=>this.records.find(r=>r.packet===e.packet)?.decisions_allowed===false))throw Error('This source is stale; recover it before importing decisions.');
       const incoming=new Map(entries.map(e=>[e.packet,e]));
       if([...incoming.keys()].some(key=>!this.records.some(r=>r.packet===key)))throw Error('This file includes recordings absent from this review page. Regenerate the index.');
       const complete=isBatch&&entries.length===this.records.length;

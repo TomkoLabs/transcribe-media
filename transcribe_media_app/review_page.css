@@ -400,3 +400,9 @@ footer {
 .range + .row,.row + .row {
   margin-top:10px;
 }
+
+.word-list { display:flex; flex-wrap:wrap; gap:5px; margin:12px 0; }
+button.word { min-height:32px; font-size:.9rem; font-weight:400; padding:3px 7px; }
+button.word-playing { background:#d1f1e3; border-color:#167350; }
+.source-excerpt { padding:8px 12px; border-left:3px solid #b7c7de; color:#44546b; font-size:.875rem; }
+.group-body > details + details { margin-top:18px; }

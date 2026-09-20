@@ -306,7 +306,8 @@ Then run:
   $LAUNCHER
 
 Quality mode is enabled by default: English, 2-3 speakers, reviewed voice profiles.
-After processing, open this file in your browser to confirm the initial voices:
+Selective vocal-emotion estimates are enabled for sufficiently clear adult speech.
+After processing, open this file in your browser to review queued soundbites:
   $ROOT/Review/speaker-reviews/index.html
 Choose Download JSON, then move the file into:
   $ROOT/speaker-decisions
