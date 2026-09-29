@@ -7,6 +7,36 @@ speaker diarization, conservative matching against reviewed voice references,
 and selective vocal-emotion estimates.
 Audio stays on the machine running the script.
 
+## Couples Insight clean-v2 handoff
+
+After processing and upstream speaker review, render and export finalized TXT:
+
+```bash
+./transcribe-media --render-transcripts
+./transcribe-media --export-analysis-ready
+```
+
+Set visible Husband/Wife labels in upstream review. Other reviewed speakers may
+remain; Couples Insight omits their dialogue. `--export-analysis-ready` is a saved
+result action: no inference, model loading, network service or VM transfer. It
+checks current source/review finality and rendering against saved evidence,
+excludes drafts/incomplete/stale files individually, preserves Unicode relative
+paths, and prints included/excluded counts and concise reasons.
+
+Default managed destination is `EXPORT_TRANSCRIBED` under the runtime root;
+`--analysis-export-dir /private/new-export` overrides it. Use an absent path or a
+previously tool-owned export. The marker records hashes/finality/time; operator
+changes or unowned directories cause refusal. Staged Linux directory exchange
+publishes the full new set atomically and removes stale files from the current
+export. Old private generations remain at the printed recovery path; inspect and
+archive them manually. Never add operator files to the managed destination.
+
+Use a fresh private runtime/review state for clean v2 (code and runtime outside
+each other's data paths). Manually copy the export contents to the Debian
+`TRANSCRIPTS` directory. The hub owns analysis and portal operations; this tool
+retains sole ownership of ASR, diarization, review and authoritative display labels.
+Version1.16.0.dev2 adds this boundary without changing the transcription pipeline.
+
 ## Quick start: Debian + RTX 3080
 
 ### 1. Prepare once

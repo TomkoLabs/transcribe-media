@@ -77,7 +77,7 @@ from .storage import (
 SAVED_RESULT_ACTIONS = (
     "review_speakers", "refresh_voices", "apply_speaker_review",
     "merge_voices", "evaluate_voices", "render_transcripts", "refresh_context",
-    "diagnose_reviews", "recover_review",
+    "diagnose_reviews", "recover_review", "export_analysis_ready",
 )
 
 # Disable optional dependency telemetry before WhisperX imports pyannote. Model
@@ -252,6 +252,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--review-speakers", action="store_true", help="build the aggregated offline speaker review page without loading models")
     parser.add_argument("--render-transcripts", action="store_true", help="regenerate text/subtitle exports from saved JSON; preserve words, speakers and profiles without loading models")
     parser.add_argument("--refresh-context", action="store_true", help="refresh acoustic/vocal-emotion context from review audio, preserving words, speaker decisions and profiles")
+    parser.add_argument("--export-analysis-ready", action="store_true", help="atomically publish current finalized TXT to a tool-owned export directory; no models")
+    parser.add_argument("--analysis-export-dir", help="managed export destination (default: EXPORT_TRANSCRIBED)")
     parser.add_argument("--diagnose-reviews", action="store_true", help="read-only source integrity and saved review status; no models")
     parser.add_argument("--recover-review", metavar="SOURCE_KEY", help="back up and recover one exact saved source key; never runs transcription")
     parser.add_argument("--relocated-source", metavar="PATH", help="with --recover-review: explicitly relocate identical media, retaining its logical source key")
@@ -449,6 +451,8 @@ def _validate_args(parser: argparse.ArgumentParser, args: argparse.Namespace) ->
         parser.error("choose one maintenance action per command")
     if args.dry_run and not args.recover_review and any(getattr(args, key) for key in SAVED_RESULT_ACTIONS):
         parser.error("--dry-run previews transcription only; omit it when running a saved-result action")
+    if args.analysis_export_dir and not args.export_analysis_ready:
+        parser.error("--analysis-export-dir requires --export-analysis-ready")
     if args.relocated_source and not args.recover_review:
         parser.error("--relocated-source requires --recover-review")
     if args.only_source:
@@ -2215,7 +2219,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 return 0
             with project_lock(paths.review_dir):
                 StateTransaction(paths.review_dir).rollback()
-                if args.recover_review:
+                if args.export_analysis_ready:
+                    from .analysis_export import export_analysis_ready
+                    target = Path(args.analysis_export_dir).expanduser().resolve() if args.analysis_export_dir else paths.root / "EXPORT_TRANSCRIBED"
+                    print(json.dumps(export_analysis_ready(paths.review_dir, paths.transcript_dir, target), indent=2))
+                elif args.recover_review:
                     from .recovery import recover_review
                     print(json.dumps(recover_review(paths.review_dir, args.recover_review,
                         relocated_source=args.relocated_source), indent=2))
